@@ -1,0 +1,73 @@
+name: Package CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '17 7 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: PHP ${{ matrix.php }} / Illuminate ${{ matrix.illuminate }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - php: '7.2'
+            illuminate: '6.20.*'
+          - php: '8.4'
+            illuminate: '13.0.*'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+          tools: composer:v2
+
+      - name: Validate Composer manifest
+        run: composer validate --strict
+
+      - name: Install the matrix framework version
+        run: composer update --with "illuminate/support:${{ matrix.illuminate }}" --prefer-dist --no-interaction --no-progress
+
+      - name: Lint PHP files
+        run: |
+          set -e
+          while IFS= read -r -d '' file; do
+            php -l "$file" >/dev/null
+          done < <(find src tests -type f -name '*.php' -print0)
+
+      - name: Run package tests
+        run: composer test
+
+      - name: Run static analysis
+        run: composer analyse
+
+      - name: Audit locked production dependencies
+        run: composer audit --locked --no-dev
+
+      - name: Install CycloneDX Composer plugin
+        if: matrix.php == '8.4'
+        run: |
+          composer global config --no-plugins allow-plugins.cyclonedx/cyclonedx-php-composer true
+          composer global require --no-interaction --no-progress cyclonedx/cyclonedx-php-composer:6.2.0
+
+      - name: Generate CycloneDX SBOM
+        if: matrix.php == '8.4'
+        run: composer CycloneDX:make-sbom --output-format=JSON --output-file=sbom.json --omit=dev --validate
+
+      - name: Upload SBOM artifact
+        if: matrix.php == '8.4'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: laravel-error-alert-sbom
+          path: sbom.json
+          if-no-files-found: error

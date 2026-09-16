@@ -8,17 +8,21 @@ class TestErrorAlertCommand extends Command
 {
     protected $signature = 'error-alert:test';
 
-    protected $description = 'Queue a sanitized test error alert.';
+    protected $description = 'Send a sanitized test error alert using the configured delivery mode.';
 
+    /**
+     * @return int
+     */
     public function handle()
     {
         $manager = app('enggarasmoro.error-alert');
         if (! $manager->report(new \RuntimeException('manual error-alert test'), ['source' => 'manual'])) {
-            $this->warn('No alert queued. Enable the feature, configure recipients, and use an allowed environment.');
+            $this->warn('No alert sent. Enable the feature, configure recipients, and use an allowed environment.');
 
             return 1;
         }
-        $this->info('Test alert queued.');
+        $delivery = strtolower(trim((string) config('error-alert.delivery', 'queue')));
+        $this->info($delivery === 'sync' ? 'Test alert sent synchronously.' : 'Test alert queued.');
 
         return 0;
     }
