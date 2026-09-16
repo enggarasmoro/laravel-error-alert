@@ -185,6 +185,15 @@ class ErrorAlertManagerTest extends TestCase
         $this->assertSame($payload, $method->invoke($job));
     }
 
+    public function test_package_manifest_does_not_require_the_unpublished_foundation_component(): void
+    {
+        $manifest = json_decode(file_get_contents(dirname(__DIR__, 2).'/composer.json'), true);
+
+        $this->assertIsArray($manifest);
+        $this->assertArrayNotHasKey('illuminate/foundation', $manifest['require']);
+        $this->assertArrayHasKey('illuminate/bus', $manifest['require']);
+    }
+
     public function test_backlog_reservation_sets_a_bounded_ttl(): void
     {
         $cache = new FakeCacheStore;

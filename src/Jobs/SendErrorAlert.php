@@ -5,7 +5,6 @@ namespace Enggarasmoro\LaravelErrorAlert\Jobs;
 use Enggarasmoro\LaravelErrorAlert\Mail\ErrorAlertMail;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
-use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Cache;
@@ -14,7 +13,7 @@ use Illuminate\Support\Facades\Mail;
 
 class SendErrorAlert implements ShouldQueue
 {
-    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    use InteractsWithQueue, Queueable, SerializesModels;
 
     /** @var int */
     public $tries = 3;
