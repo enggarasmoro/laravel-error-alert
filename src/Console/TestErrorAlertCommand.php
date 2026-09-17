@@ -15,13 +15,15 @@ class TestErrorAlertCommand extends Command
      */
     public function handle()
     {
-        $manager = app('enggarasmoro.error-alert');
+        $application = $this->getLaravel();
+        $manager = $application->make('enggarasmoro.error-alert');
         if (! $manager->report(new \RuntimeException('manual error-alert test'), ['source' => 'manual'])) {
             $this->warn('No alert sent. Enable the feature, configure recipients, and use an allowed environment.');
 
             return 1;
         }
-        $delivery = strtolower(trim((string) config('error-alert.delivery', 'queue')));
+        $config = $application->make('config');
+        $delivery = strtolower(trim((string) $config->get('error-alert.delivery', 'queue')));
         $this->info($delivery === 'sync' ? 'Test alert sent synchronously.' : 'Test alert queued.');
 
         return 0;

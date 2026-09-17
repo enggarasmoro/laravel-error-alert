@@ -4,6 +4,7 @@ namespace Enggarasmoro\LaravelErrorAlert\Tests\Unit;
 
 use Enggarasmoro\LaravelErrorAlert\ErrorAlertManager;
 use Enggarasmoro\LaravelErrorAlert\Console\CheckErrorAlertCommand;
+use Enggarasmoro\LaravelErrorAlert\Console\TestErrorAlertCommand;
 use Enggarasmoro\LaravelErrorAlert\Events\AlertRequested;
 use Enggarasmoro\LaravelErrorAlert\Jobs\SendErrorAlert;
 use Enggarasmoro\LaravelErrorAlert\Mail\ErrorAlertMail;
@@ -420,6 +421,23 @@ class ErrorAlertManagerTest extends TestCase
         );
     }
 
+    public function test_test_command_resolves_manager_and_configuration_from_bound_application(): void
+    {
+        $container = new FakeLaravelContainer('testing');
+        $container->instance('enggarasmoro.error-alert', new FakeTestAlertManager);
+        $container->instance('config', new FakeGlobalConfig([
+            'error-alert.delivery' => 'sync',
+        ]));
+        Container::setInstance(new Container);
+
+        $command = new TestErrorAlertCommand;
+        $command->setLaravel($container);
+        $tester = new CommandTester($command);
+
+        $this->assertSame(0, $tester->execute([]));
+        $this->assertStringContainsString('Test alert sent synchronously.', $tester->getDisplay());
+    }
+
     public function test_check_command_rejects_an_unconfigured_cache_store(): void
     {
         $tester = $this->checkCommand([
@@ -547,6 +565,16 @@ class ErrorAlertManagerTest extends TestCase
         $this->assertCount(1, $logger->warnings);
         $this->assertSame('error_alert_exception_handler_registration_failed', $logger->warnings[0][0]);
         $this->assertSame(['type' => \RuntimeException::class], $logger->warnings[0][1]);
+    }
+
+    public function test_provider_resolves_config_publish_path_from_bound_application(): void
+    {
+        $app = new FakeLaravelContainer('testing');
+        $provider = new TestableErrorAlertServiceProvider($app);
+        $method = new \ReflectionMethod($provider, 'configurationPath');
+        $method->setAccessible(true);
+
+        $this->assertSame('/test/config/error-alert.php', $method->invoke($provider, 'error-alert.php'));
     }
 
     protected function invokePayload(ErrorAlertManager $manager, $exception, array $context = [])
@@ -854,6 +882,14 @@ class FakeLegacyMailer
 
     public function send($mailable)
     {
+    }
+}
+
+class FakeTestAlertManager
+{
+    public function report($exception, array $context = [])
+    {
+        return true;
     }
 }
 

@@ -68,7 +68,7 @@ class ErrorAlertServiceProvider extends ServiceProvider
         if ($this->app->runningInConsole()) {
             $this->commands([CheckErrorAlertCommand::class, TestErrorAlertCommand::class]);
         }
-        $this->publishes([__DIR__.'/../config/error-alert.php' => config_path('error-alert.php')], 'error-alert-config');
+        $this->publishes([__DIR__.'/../config/error-alert.php' => $this->configurationPath('error-alert.php')], 'error-alert-config');
     }
 
     /**
@@ -84,5 +84,17 @@ class ErrorAlertServiceProvider extends ServiceProvider
         } catch (\Throwable $ignored) {
             // Error reporting setup must never replace the application error path.
         }
+    }
+
+    /**
+     * Resolve the consumer's config directory without requiring Laravel Foundation
+     * helper functions, which are not dependencies of this package.
+     *
+     * @param  string  $path
+     * @return string
+     */
+    protected function configurationPath($path = '')
+    {
+        return $this->app->configPath($path);
     }
 }
