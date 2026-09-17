@@ -18,7 +18,7 @@ class CheckErrorAlertCommand extends Command
     public function handle()
     {
         /** @var array<string, mixed> $config */
-        $config = (array) config('error-alert', []);
+        $config = (array) $this->configuration('error-alert', []);
         $errors = [];
         $warnings = [];
         if (empty($config['recipients'])) {
@@ -37,14 +37,14 @@ class CheckErrorAlertCommand extends Command
         } elseif ($delivery === 'queue') {
             $connection = isset($config['connection']) ? trim((string) $config['connection']) : '';
             if ($connection === '') {
-                $connection = trim((string) config('queue.default', ''));
+                $connection = trim((string) $this->configuration('queue.default', ''));
             }
             if ($connection === '') {
                 $errors[] = 'ERROR_ALERT_QUEUE_CONNECTION is empty and queue.default is not configured.';
             } elseif (strtolower($connection) === 'sync' && ! $this->syncQueueAllowed($config)) {
                 $errors[] = 'Synchronous queue driver is disabled. Configure ERROR_ALERT_DELIVERY=sync for direct mail or use a worker-backed queue connection.';
             } else {
-                $connections = (array) config('queue.connections', []);
+                $connections = (array) $this->configuration('queue.connections', []);
                 if ($connections !== [] && ! array_key_exists($connection, $connections)) {
                     $errors[] = "Configured queue connection does not exist: {$connection}";
                 } elseif (isset($connections[$connection]) && is_array($connections[$connection])) {
@@ -61,7 +61,7 @@ class CheckErrorAlertCommand extends Command
                 $errors[] = 'ERROR_ALERT_QUEUE is empty.';
             }
 
-            if (app()->environment('production') && empty($config['encrypt_payload'])) {
+            if ($this->applicationEnvironment('production') && empty($config['encrypt_payload'])) {
                 $warnings[] = 'WARNING: queued alert payload encryption is disabled in production; recipients and diagnostic details may be readable in queue storage.';
             }
         }
@@ -69,7 +69,7 @@ class CheckErrorAlertCommand extends Command
         $this->validateCacheStore($config, $errors);
 
         if (! empty($config['mailer'])) {
-            $mailers = (array) config('mail.mailers', []);
+            $mailers = (array) $this->configuration('mail.mailers', []);
             if ($mailers !== [] && ! array_key_exists($config['mailer'], $mailers)) {
                 $errors[] = "Configured mailer does not exist: {$config['mailer']}";
             } elseif ($mailers === []) {
@@ -100,7 +100,7 @@ class CheckErrorAlertCommand extends Command
     protected function syncQueueAllowed(array $config)
     {
         return (bool) ($config['allow_sync'] ?? false)
-            && in_array(app()->environment(), ['local', 'testing'], true);
+            && in_array($this->applicationEnvironment(), ['local', 'testing'], true);
     }
 
     /**
@@ -111,7 +111,7 @@ class CheckErrorAlertCommand extends Command
     protected function validateCacheStore(array $config, array &$errors)
     {
         $configuredStore = isset($config['cache_store']) ? trim((string) $config['cache_store']) : '';
-        $defaultStore = trim((string) config('cache.default', ''));
+        $defaultStore = trim((string) $this->configuration('cache.default', ''));
         $storeName = $configuredStore !== '' ? $configuredStore : $defaultStore;
         if ($storeName === '') {
             $errors[] = 'ERROR_ALERT_CACHE_STORE is empty and cache.default is not configured.';
@@ -119,7 +119,7 @@ class CheckErrorAlertCommand extends Command
             return;
         }
 
-        $stores = (array) config('cache.stores', []);
+        $stores = (array) $this->configuration('cache.stores', []);
         if ($stores !== [] && ! array_key_exists($storeName, $stores)) {
             $errors[] = "Configured cache store does not exist: {$storeName}";
 
@@ -153,5 +153,61 @@ class CheckErrorAlertCommand extends Command
                 }
             }
         }
+    }
+
+    /**
+     * Resolve configuration through the command's bound Laravel application.
+     * This keeps package-only command tests independent of the global helper
+     * while retaining the helper fallback for legacy Laravel applications.
+     *
+     * @param  string  $key
+     * @param  mixed  $default
+     * @return mixed
+     */
+    protected function configuration(string $key, $default = null)
+    {
+        try {
+            $application = $this->getLaravel();
+            $config = $application->make('config');
+            if (is_object($config) && method_exists($config, 'get')) {
+                return $config->get($key, $default);
+            }
+        } catch (Throwable $ignored) {
+            // Fall through to the legacy helper when a container is unavailable.
+        }
+
+        if (function_exists('config')) {
+            return config($key, $default);
+        }
+
+        return $default;
+    }
+
+    /**
+     * @param  string|null  $expected
+     * @return string|bool
+     */
+    protected function applicationEnvironment($expected = null)
+    {
+        try {
+            $application = $this->getLaravel();
+            $environment = $application->environment();
+
+            return $expected === null ? $environment : $environment === $expected;
+        } catch (Throwable $ignored) {
+            // Fall through to the legacy helper when a container is unavailable.
+        }
+
+        if (function_exists('app')) {
+            try {
+                $environment = app()->environment();
+
+                return $expected === null ? $environment : $environment === $expected;
+            } catch (Throwable $ignored) {
+                // Treat an unavailable application as not matching the environment.
+            }
+        }
+
+        return $expected === null ? '' : false;
     }
 }

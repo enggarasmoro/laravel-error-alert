@@ -20,6 +20,9 @@ use Symfony\Component\HttpKernel\Exception\HttpException;
 
 class ErrorAlertManagerTest extends TestCase
 {
+    /** @var CheckErrorAlertCommand|null */
+    protected $lastCommand;
+
     public function test_disabled_alerts_do_not_touch_the_backend(): void
     {
         $app = new FakeApplication(false, ['enabled' => false]);
@@ -395,6 +398,28 @@ class ErrorAlertManagerTest extends TestCase
         $this->assertStringContainsString('payload encryption is disabled', $tester->getDisplay());
     }
 
+    public function test_check_command_reads_configuration_from_its_bound_application(): void
+    {
+        $tester = $this->checkCommand([
+            'error-alert' => [
+                'recipients' => ['ops@example.test'],
+                'delivery' => 'sync',
+                'cache_store' => 'redis',
+            ],
+            'cache.default' => 'redis',
+            'cache.stores' => ['redis' => ['driver' => 'array']],
+        ], 'testing');
+
+        $command = $this->lastCommand;
+        $method = new \ReflectionMethod($command, 'configuration');
+        $method->setAccessible(true);
+
+        $this->assertSame(
+            ['recipients' => ['ops@example.test'], 'delivery' => 'sync', 'cache_store' => 'redis'],
+            $method->invoke($command, 'error-alert', [])
+        );
+    }
+
     public function test_check_command_rejects_an_unconfigured_cache_store(): void
     {
         $tester = $this->checkCommand([
@@ -591,6 +616,7 @@ class ErrorAlertManagerTest extends TestCase
 
         $command = new CheckErrorAlertCommand;
         $command->setLaravel($container);
+        $this->lastCommand = $command;
 
         return new CommandTester($command);
     }
