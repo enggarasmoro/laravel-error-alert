@@ -27,6 +27,9 @@ ERROR_ALERT_ALLOW_SYNC_QUEUE=false
 ERROR_ALERT_ENCRYPT_QUEUE_PAYLOAD=true
 ERROR_ALERT_CACHE_STORE=redis
 ERROR_ALERT_DETAIL_MAX_LENGTH=500
+ERROR_ALERT_COOLDOWN=900
+ERROR_ALERT_MAX_PER_HOUR=20
+ERROR_ALERT_MAX_BACKLOG=100
 ERROR_ALERT_BACKLOG_TTL=86400
 ```
 
@@ -49,9 +52,11 @@ Validasi tanpa mengirim email dengan `php artisan error-alert:check`. Command in
 - Laravel 8–13: provider memasang callback `reportable` otomatis.
 - Laravel 6–7: panggil `ErrorAlert::report($exception)` dari `report()` pada exception handler aplikasi.
 
+Laravel 6 dipertahankan sebagai compatibility-only lane. Framework dan dependency-nya sudah end-of-life, sehingga audit advisory pada lane tersebut bersifat informasional; gunakan Laravel yang masih didukung untuk posture keamanan produksi.
+
 HTTP 5xx, exception console, dan permanently failed queue job dapat masuk alert. HTTP 4xx diabaikan. Payload email berisi metadata dan pesan exception yang sudah diringkas, di-escape, dibatasi `ERROR_ALERT_DETAIL_MAX_LENGTH` (default 500 karakter), dinormalisasi ke UTF-8, dan dibersihkan dari karakter kontrol. Pola credential umum (termasuk password, token, cookie, authorization, API key, private key, dan credential database/cloud) diganti dengan `[REDACTED]`; stack trace, request body, dan SQL tidak dikumpulkan. Hindari menaruh rahasia di pesan exception dan perlakukan backend queue sebagai trust boundary aplikasi: gunakan ACL/TLS, batasi retensi, dan jangan membagikan queue kepada tenant yang tidak berwenang. Set `ERROR_ALERT_DETAIL_MAX_LENGTH=0` untuk menonaktifkan detail pesan.
 
-Alert memakai cooldown fingerprint, rate limit per jam, dan batas backlog. Counter backlog memiliki TTL terbatas (`ERROR_ALERT_BACKLOG_TTL`, default 86.400 detik); atur nilainya agar lebih panjang daripada waktu antre dan retry maksimum pada deployment Anda. Jika counter perlu direkonsiliasi, pastikan tidak ada alert job aktif lalu hapus key `enggarasmoro:error-alert:backlog:` ditambah SHA-1 dari `service|environment` melalui cache store yang sama, misalnya dari Tinker:
+Alert memakai cooldown fingerprint, rate limit per jam, dan batas backlog. Counter backlog memiliki TTL terbatas (`ERROR_ALERT_BACKLOG_TTL`, default 86.400 detik) serta marker generasi per reservation; job lama yang marker-nya sudah kedaluwarsa tidak dapat mengurangi counter generasi baru. Atur TTL agar lebih panjang daripada waktu antre dan retry maksimum pada deployment Anda. Jika counter perlu direkonsiliasi, pastikan tidak ada alert job aktif lalu hapus key `enggarasmoro:error-alert:backlog:` ditambah SHA-1 dari `service|environment` melalui cache store yang sama, misalnya dari Tinker:
 
 ```php
 $key = 'enggarasmoro:error-alert:backlog:'.sha1(config('error-alert.service').'|'.app()->environment());

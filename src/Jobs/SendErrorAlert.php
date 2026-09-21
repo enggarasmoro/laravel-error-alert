@@ -9,6 +9,7 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Crypt;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Mail;
 
 class SendErrorAlert implements ShouldQueue
@@ -31,6 +32,12 @@ class SendErrorAlert implements ShouldQueue
     public $backlogKey;
 
     /** @var string|null */
+    public $backlogGenerationKey;
+
+    /** @var string|null */
+    public $backlogCounterKey;
+
+    /** @var string|null */
     public $cacheStore;
 
     /** @var bool */
@@ -50,6 +57,8 @@ class SendErrorAlert implements ShouldQueue
     {
         $this->encrypted = (bool) $encrypt;
         $this->backlogKey = isset($payload['backlog_key']) ? (string) $payload['backlog_key'] : null;
+        $this->backlogGenerationKey = isset($payload['backlog_generation_key']) ? (string) $payload['backlog_generation_key'] : null;
+        $this->backlogCounterKey = isset($payload['backlog_counter_key']) ? (string) $payload['backlog_counter_key'] : null;
         $this->cacheStore = isset($payload['cache_store']) ? (string) $payload['cache_store'] : null;
         $this->ownsBacklogReservation = (bool) $ownsBacklogReservation;
         $this->payload = $this->encrypted ? Crypt::encrypt($payload) : $payload;
@@ -115,15 +124,48 @@ class SendErrorAlert implements ShouldQueue
         try {
             $payload = is_array($this->payload) ? $this->payload : [];
             $cacheStore = $this->cacheStore ?: (isset($payload['cache_store']) ? $payload['cache_store'] : null);
-            $backlogKey = $this->backlogKey ?: (isset($payload['backlog_key']) ? $payload['backlog_key'] : null);
+            $generationKey = $this->backlogGenerationKey ?: (isset($payload['backlog_generation_key']) ? $payload['backlog_generation_key'] : null);
+            $counterKey = $this->backlogCounterKey ?: (isset($payload['backlog_counter_key']) ? $payload['backlog_counter_key'] : null);
             $store = ! empty($cacheStore) ? Cache::store($cacheStore) : Cache::store();
-            if ($backlogKey !== null && $backlogKey !== '') {
-                $store->decrement($backlogKey);
+            if ($generationKey === null || $generationKey === '' || $counterKey === null || $counterKey === '') {
                 $this->backlogReleased = true;
+
+                return;
             }
+
+            $released = method_exists($store, 'pull')
+                ? $store->pull($generationKey, null)
+                : $this->pullCacheKey($store, $generationKey);
+            if ($released === null) {
+                $this->backlogReleased = true;
+
+                return;
+            }
+
+            $store->decrement($counterKey);
+            $this->backlogReleased = true;
         } catch (\Throwable $ignored) {
-            // Alert bookkeeping must never create a second alert.
+            try {
+                Log::error('error_alert_backlog_release_failed', ['type' => get_class($ignored)]);
+            } catch (\Throwable $logException) {
+                // Alert bookkeeping must never create a second alert.
+            }
         }
+    }
+
+    /**
+     * @param  mixed  $store
+     * @param  string  $key
+     * @return mixed
+     */
+    protected function pullCacheKey($store, $key)
+    {
+        $value = $store->get($key, null);
+        if ($value !== null) {
+            $store->forget($key);
+        }
+
+        return $value;
     }
 
     /**

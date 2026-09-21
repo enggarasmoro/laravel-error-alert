@@ -219,7 +219,7 @@ class ErrorAlertManager
      * @param  array<string, mixed>  $payload
      * @return bool
      */
-    protected function reserve(array $payload)
+    protected function reserve(array &$payload)
     {
         $config = $this->config();
         $cache = $config['cache_store'] ? Cache::store($config['cache_store']) : Cache::store();
@@ -229,24 +229,52 @@ class ErrorAlertManager
         }
 
         $rateKey = 'enggarasmoro:error-alert:rate:'.sha1($config['service'].'|'.$this->app->environment());
+        // Initialise the key without overwriting a value created by a
+        // concurrent reservation between increment and TTL assignment.
+        $cache->add($rateKey, 0, 3600);
         $count = $cache->increment($rateKey);
-        if ((int) $count === 1) {
-            $cache->put($rateKey, 1, 3600);
-        }
         if ((int) $count > $config['max_per_hour']) {
             return false;
         }
 
         $backlogKey = $payload['backlog_key'];
-        $cache->add($backlogKey, 0, $config['backlog_ttl']);
-        $backlog = $cache->increment($backlogKey);
-        if ((int) $backlog > $config['max_backlog']) {
-            $cache->decrement($backlogKey);
+        $generation = bin2hex(random_bytes(16));
+        $generationKey = $backlogKey.':generation:'.$generation;
+        $counterIncremented = false;
 
-            return false;
+        try {
+            if (! $cache->add($generationKey, 1, $config['backlog_ttl'])) {
+                return false;
+            }
+
+            $cache->add($backlogKey, 0, $config['backlog_ttl']);
+            $backlog = $cache->increment($backlogKey);
+            $counterIncremented = true;
+            if ((int) $backlog > $config['max_backlog']) {
+                $cache->decrement($backlogKey);
+                $counterIncremented = false;
+                $cache->forget($generationKey);
+
+                return false;
+            }
+
+            $payload['backlog_generation'] = $generation;
+            $payload['backlog_generation_key'] = $generationKey;
+            $payload['backlog_counter_key'] = $backlogKey;
+
+            return true;
+        } catch (Throwable $exception) {
+            try {
+                $cache->forget($generationKey);
+                if ($counterIncremented) {
+                    $cache->decrement($backlogKey);
+                }
+            } catch (Throwable $cleanupException) {
+                $this->log('error_alert_backlog_release_failed', ['type' => get_class($cleanupException)]);
+            }
+
+            throw $exception;
         }
-
-        return true;
     }
 
     /**
@@ -258,10 +286,42 @@ class ErrorAlertManager
         try {
             $config = $this->config();
             $cache = $config['cache_store'] ? Cache::store($config['cache_store']) : Cache::store();
-            $cache->decrement($payload['backlog_key']);
-        } catch (Throwable $ignored) {
-            // A conservative counter is safer than blocking the application path.
+            $generationKey = isset($payload['backlog_generation_key'])
+                ? (string) $payload['backlog_generation_key']
+                : '';
+            $counterKey = isset($payload['backlog_counter_key'])
+                ? (string) $payload['backlog_counter_key']
+                : '';
+            if ($generationKey === '' || $counterKey === '') {
+                return;
+            }
+
+            $released = method_exists($cache, 'pull')
+                ? $cache->pull($generationKey, null)
+                : $this->pullCacheKey($cache, $generationKey);
+            if ($released === null) {
+                return;
+            }
+
+            $cache->decrement($counterKey);
+        } catch (Throwable $exception) {
+            $this->log('error_alert_backlog_release_failed', ['type' => get_class($exception)]);
         }
+    }
+
+    /**
+     * @param  mixed  $cache
+     * @param  string  $key
+     * @return mixed
+     */
+    protected function pullCacheKey($cache, $key)
+    {
+        $value = $cache->get($key, null);
+        if ($value !== null) {
+            $cache->forget($key);
+        }
+
+        return $value;
     }
 
     /**
@@ -346,6 +406,13 @@ class ErrorAlertManager
             return null;
         }
 
+        if ($this->isDatabaseQueryException($exception)) {
+            return $this->normalizeText(
+                'Database query failed; SQL, bindings, and connection details were omitted.',
+                $maxLength
+            );
+        }
+
         $detail = trim((string) $this->normalizeText($exception->getMessage()));
         if ($detail === '') {
             return null;
@@ -364,14 +431,14 @@ class ErrorAlertManager
             (string) $detail
         );
         $detail = preg_replace_callback(
-            '/"?(password|passwd|secret|token|access[_-]?token|refresh[_-]?token|api[_-]?key|authorization|cookie|session(?:[_-]?id)?|client[_-]?secret|private[_-]?key|aws[_-]?(?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key)|db[_-]?(?:password|user)|database[_-]?(?:password|user))"?\s*([:=])\s*(?:"[^"]*"|\'[^\']*\'|Bearer\s+[^\s,;]+|[^\s,;]+)/i',
+            '/"?(password|passwd|secret[_-]?key|encryption[_-]?key|signing[_-]?key|secret|token|access[_-]?token|refresh[_-]?token|api[_-]?key|authorization|cookie|session(?:[_-]?id)?|client[_-]?secret|private[_-]?key|aws[_-]?(?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key)|db[_-]?(?:password|user)|database[_-]?(?:password|user))"?\s*([:=])\s*(?:"[^"]*"|\'[^\']*\'|Bearer\s+[^\s,;]+|[^\s,;]+)/i',
             static function (array $matches) {
                 return $matches[1].$matches[2].($matches[2] === ':' ? ' ' : '').'[REDACTED]';
             },
             (string) $detail
         );
         $detail = preg_replace('/\bBearer\s+[^\s,;]+/i', 'Bearer [REDACTED]', (string) $detail);
-        $detail = preg_replace('/([?&](?:password|passwd|token|access[_-]?token|refresh[_-]?token|api[_-]?key|secret|cookie|session(?:[_-]?id)?|client[_-]?secret|private[_-]?key)=)[^&\s]+/i', '$1[REDACTED]', (string) $detail);
+        $detail = preg_replace('/([?&](?:password|passwd|secret[_-]?key|encryption[_-]?key|signing[_-]?key|token|access[_-]?token|refresh[_-]?token|api[_-]?key|secret|cookie|session(?:[_-]?id)?|client[_-]?secret|private[_-]?key)=)[^&\s]+/i', '$1[REDACTED]', (string) $detail);
         $detail = preg_replace('/(\b[a-z][a-z0-9+.-]*:\/\/[^\/\s:@]+:)[^@\s]+@/i', '$1[REDACTED]@', (string) $detail);
         $detail = trim((string) preg_replace('/\s+/', ' ', (string) $this->normalizeText($detail)));
 
@@ -380,6 +447,21 @@ class ErrorAlertManager
         }
 
         return substr($detail, 0, $maxLength);
+    }
+
+    /**
+     * Query exceptions expose SQL and bindings through framework-specific
+     * methods. Detect the contract without requiring illuminate/database so
+     * the package remains installable across Laravel 6 through 13.
+     *
+     * @param  mixed  $exception
+     * @return bool
+     */
+    protected function isDatabaseQueryException($exception)
+    {
+        return is_object($exception)
+            && method_exists($exception, 'getSql')
+            && method_exists($exception, 'getBindings');
     }
 
     /**

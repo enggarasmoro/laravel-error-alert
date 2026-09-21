@@ -66,6 +66,61 @@ class ErrorAlertManagerTest extends TestCase
         $this->assertStringContainsString('AWS_SECRET_ACCESS_KEY=[REDACTED]', $payload['detail']);
     }
 
+    public function test_exception_detail_redacts_secret_key_variants_in_structured_forms(): void
+    {
+        $app = new FakeApplication(false, [
+            'enabled' => true,
+            'detail_max_length' => 500,
+        ]);
+        $manager = new ErrorAlertManager($app);
+        $exception = new \RuntimeException(
+            'secret_key="secret-value" encryption-key: encryption-value '
+            .'signing_key=signing-value https://example.test/probe?secret_key=query-value'
+        );
+
+        $payload = $this->invokePayload($manager, $exception);
+
+        $this->assertStringNotContainsString('secret-value', $payload['detail']);
+        $this->assertStringNotContainsString('encryption-value', $payload['detail']);
+        $this->assertStringNotContainsString('signing-value', $payload['detail']);
+        $this->assertStringNotContainsString('query-value', $payload['detail']);
+        $this->assertStringContainsString('secret_key=[REDACTED]', $payload['detail']);
+        $this->assertStringContainsString('encryption-key: [REDACTED]', $payload['detail']);
+        $this->assertStringContainsString('signing_key=[REDACTED]', $payload['detail']);
+        $this->assertStringContainsString('secret_key=[REDACTED]', $payload['detail']);
+    }
+
+    public function test_query_exception_detail_omits_sql_bindings_connection_and_database_details(): void
+    {
+        $app = new FakeApplication(false, [
+            'enabled' => true,
+            'detail_max_length' => 500,
+        ]);
+        $manager = new ErrorAlertManager($app);
+        $exception = new QueryExceptionDouble(
+            'SQLSTATE[HY000]: General error: 7 Connection: reporting '
+            .'SQL: select * from users where email = ? '
+            .'Bindings: ["person@example.test"] Host: db.internal Database: production'
+        );
+
+        $payload = $this->invokePayload($manager, $exception);
+        $job = new SendErrorAlert([
+            'recipients' => ['ops@example.test'],
+            'detail' => $payload['detail'],
+            'backlog_key' => 'error-alert-backlog',
+        ], 'redis', 'error-alerts', false);
+        $resolvedPayload = $this->invokeResolvedPayload($job);
+        $mail = new ErrorAlertMail($resolvedPayload);
+        $mail->build();
+
+        $this->assertSame('Database query failed; SQL, bindings, and connection details were omitted.', $payload['detail']);
+        $this->assertSame($payload['detail'], $resolvedPayload['detail']);
+        $this->assertStringNotContainsString('select * from users', $mail->payload['detail']);
+        $this->assertStringNotContainsString('db.internal', $mail->payload['detail']);
+        $this->assertStringNotContainsString('production', $mail->payload['detail']);
+        $this->assertSame('enggarasmoro-error-alert::email', $mail->view);
+    }
+
     public function test_outbound_payload_strings_are_utf8_and_free_of_c0_controls(): void
     {
         $app = new FakeApplication(false, [
@@ -213,6 +268,91 @@ class ErrorAlertManagerTest extends TestCase
         ]));
         $this->assertSame(1, $cache->values['alert-backlog']);
         $this->assertSame(43200, $cache->ttls['alert-backlog']);
+    }
+
+    public function test_stale_backlog_release_does_not_decrement_a_new_generation(): void
+    {
+        $cache = new FakeCacheStore;
+        $app = new FakeApplication(false, [
+            'enabled' => true,
+            'backlog_ttl' => 43200,
+        ]);
+        $app['cache'] = new FakeCacheManager($cache);
+        $app['log'] = new FakeLogger;
+        $this->installFacades($app);
+        $manager = new ErrorAlertManager($app);
+
+        $oldPayload = [
+            'fingerprint' => 'old-fingerprint',
+            'backlog_key' => 'alert-backlog',
+        ];
+        $this->assertTrue($this->invokeReservePayload($manager, $oldPayload));
+        $oldGeneration = $oldPayload['backlog_generation'];
+        $oldGenerationKey = $oldPayload['backlog_generation_key'];
+        $oldCounterKey = $oldPayload['backlog_counter_key'];
+
+        $cache->forget($oldGenerationKey);
+
+        $newPayload = [
+            'fingerprint' => 'new-fingerprint',
+            'backlog_key' => 'alert-backlog',
+        ];
+        $this->assertTrue($this->invokeReservePayload($manager, $newPayload));
+        $this->assertNotSame($oldGeneration, $newPayload['backlog_generation']);
+        $this->assertSame(2, $cache->values[$newPayload['backlog_counter_key']]);
+
+        $manager->releaseBacklog($oldPayload);
+
+        $this->assertSame(2, $cache->values[$newPayload['backlog_counter_key']]);
+        $this->assertSame(2, $cache->values[$oldCounterKey]);
+
+        $manager->releaseBacklog($newPayload);
+
+        $this->assertSame(1, $cache->values[$newPayload['backlog_counter_key']]);
+    }
+
+    public function test_backlog_cleanup_failure_is_logged_and_does_not_escape(): void
+    {
+        $cache = new FakeCacheStore;
+        $logger = new FakeLogger;
+        $app = new FakeApplication(false, ['enabled' => true, 'backlog_ttl' => 43200]);
+        $app['cache'] = new FakeCacheManager($cache);
+        $app['log'] = $logger;
+        $this->installFacades($app);
+        $manager = new ErrorAlertManager($app);
+        $payload = [
+            'fingerprint' => 'cleanup-failure',
+            'backlog_key' => 'alert-backlog',
+        ];
+        $this->assertTrue($this->invokeReservePayload($manager, $payload));
+        $cache->throwOnDecrement = true;
+
+        $manager->releaseBacklog($payload);
+
+        $this->assertSame('error_alert_backlog_release_failed', $logger->errors[0][0]);
+        $this->assertSame(['type' => \RuntimeException::class], $logger->errors[0][1]);
+    }
+
+    public function test_rate_limit_cold_key_initialization_does_not_reset_a_concurrent_increment(): void
+    {
+        $cache = new FakeCacheStore;
+        $cache->simulateRateInitializationRace = true;
+        $app = new FakeApplication(false, [
+            'enabled' => true,
+            'max_per_hour' => 20,
+        ]);
+        $app['cache'] = new FakeCacheManager($cache);
+        $this->installFacades($app);
+        $manager = new ErrorAlertManager($app);
+        $payload = [
+            'fingerprint' => 'rate-race',
+            'backlog_key' => 'alert-backlog',
+        ];
+
+        $this->assertTrue($this->invokeReserve($manager, $payload));
+
+        $rateKey = 'enggarasmoro:error-alert:rate:'.sha1('laravel-app|testing');
+        $this->assertSame(2, $cache->values[$rateKey]);
     }
 
     public function test_failed_reservation_does_not_decrement_an_unowned_backlog_slot(): void
@@ -603,10 +743,28 @@ class ErrorAlertManagerTest extends TestCase
 
     protected function invokeReserve(ErrorAlertManager $manager, array $payload): bool
     {
+        return $this->invokeReservePayload($manager, $payload);
+    }
+
+    /**
+     * @param  array<string, mixed>  $payload
+     * @return bool
+     */
+    protected function invokeReservePayload(ErrorAlertManager $manager, array &$payload): bool
+    {
         $method = new \ReflectionMethod($manager, 'reserve');
         $method->setAccessible(true);
 
-        return (bool) $method->invoke($manager, $payload);
+        return (bool) $method->invokeArgs($manager, [&$payload]);
+    }
+
+    /** @return array<string, mixed> */
+    protected function invokeResolvedPayload(SendErrorAlert $job): array
+    {
+        $method = new \ReflectionMethod($job, 'resolvedPayload');
+        $method->setAccessible(true);
+
+        return $method->invoke($job);
     }
 
     protected function invokeSyncSend(ErrorAlertManager $manager, array $payload): bool
@@ -794,11 +952,23 @@ class FakeCacheStore
 
     public $throwOnGet = false;
 
+    public $throwOnDecrement = false;
+
+    public $simulateRateInitializationRace = false;
+
     public function forget($key)
     {
         unset($this->values[$key], $this->ttls[$key]);
 
         return true;
+    }
+
+    public function pull($key, $default = null)
+    {
+        $value = $this->get($key, $default);
+        $this->forget($key);
+
+        return $value;
     }
 
     public function get($key, $default = null)
@@ -828,6 +998,13 @@ class FakeCacheStore
             throw new \RuntimeException('cache unavailable');
         }
 
+        if ($this->simulateRateInitializationRace && strpos($key, ':rate:') !== false) {
+            $this->simulateRateInitializationRace = false;
+            $this->values[$key] = 2;
+
+            return 1;
+        }
+
         $this->values[$key] = (int) (isset($this->values[$key]) ? $this->values[$key] : 0) + $amount;
 
         return $this->values[$key];
@@ -835,6 +1012,10 @@ class FakeCacheStore
 
     public function decrement($key, $amount = 1)
     {
+        if ($this->throwOnDecrement) {
+            throw new \RuntimeException('cache cleanup unavailable');
+        }
+
         $this->values[$key] = (int) (isset($this->values[$key]) ? $this->values[$key] : 0) - $amount;
 
         return $this->values[$key];
@@ -1029,5 +1210,18 @@ class FailingReportableExceptionHandlerDouble
     public function reportable($callback)
     {
         throw new \RuntimeException('sensitive handler setup details');
+    }
+}
+
+class QueryExceptionDouble extends \RuntimeException
+{
+    public function getSql()
+    {
+        return 'select * from users where email = ?';
+    }
+
+    public function getBindings()
+    {
+        return ['person@example.test'];
     }
 }

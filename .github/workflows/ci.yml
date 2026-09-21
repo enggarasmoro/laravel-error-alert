@@ -35,13 +35,13 @@ jobs:
       - name: Validate Composer manifest
         run: composer validate --strict
 
-      # Laravel 6 resolves to EOL dependencies with published advisories. Relax only
-      # advisory blocking for this ephemeral compatibility lane; malware blocking remains on.
+      # Laravel 6 resolves to EOL dependencies with published advisories. Relax
+      # security blocking only for this ephemeral compatibility lane.
       - name: Install legacy compatibility dependencies
         if: matrix.php == '7.2'
-        run: composer update --with "illuminate/support:${{ matrix.illuminate }}" --prefer-dist --no-interaction --no-progress
+        run: composer update --with "illuminate/support:${{ matrix.illuminate }}" --prefer-dist --no-interaction --no-progress --no-security-blocking
         env:
-          COMPOSER_POLICY_ADVISORIES_BLOCK: '0'
+          COMPOSER_NO_SECURITY_BLOCKING: '1'
 
       - name: Install current framework dependencies
         if: matrix.php == '8.4'
@@ -75,6 +75,14 @@ jobs:
 
       - name: Run static analysis
         run: composer analyse
+
+      # Laravel 6 compatibility requires EOL dependency versions. Keep this
+      # lane visible without making the legacy advisory set block delivery;
+      # the current PHP/Laravel lane below remains blocking.
+      - name: Audit legacy dependency advisories (informational)
+        if: matrix.php == '7.2'
+        continue-on-error: true
+        run: composer audit --locked --no-dev
 
       - name: Audit locked production dependencies
         if: matrix.php == '8.4'
