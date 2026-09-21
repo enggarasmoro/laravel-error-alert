@@ -3,6 +3,7 @@
 namespace Enggarasmoro\LaravelErrorAlert\Console;
 
 use Illuminate\Console\Command;
+use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Support\Facades\Cache;
 use Throwable;
 
@@ -128,9 +129,26 @@ class CheckErrorAlertCommand extends Command
 
         $probeKey = null;
         $probeCreated = false;
+        $store = null;
         try {
             $probeKey = '__enggarasmoro_error_alert_check:'.bin2hex(random_bytes(16));
             $store = $configuredStore !== '' ? Cache::store($configuredStore) : Cache::store();
+            if ($this->applicationEnvironment('production')) {
+                $configuredDriver = '';
+                if (isset($stores[$storeName]) && is_array($stores[$storeName])) {
+                    $configuredDriver = strtolower(trim((string) ($stores[$storeName]['driver'] ?? '')));
+                }
+                if ($this->isProcessLocalCacheStore($configuredDriver, $store)) {
+                    $errors[] = "Production error-alert cache store must be shared; process-local drivers (array, file, null) are not allowed: {$storeName}";
+
+                    return;
+                }
+                if (! $this->supportsDistributedCacheLock($store)) {
+                    $errors[] = "Production error-alert cache store must support distributed lock operations: {$storeName}";
+
+                    return;
+                }
+            }
             $probeCreated = $store->add($probeKey, 1, 60);
             if (! $probeCreated
                 || (int) $store->increment($probeKey) !== 2) {
@@ -153,6 +171,54 @@ class CheckErrorAlertCommand extends Command
                 }
             }
         }
+    }
+
+    /**
+     * Process-local stores cannot coordinate backlog ownership across workers.
+     * The class check covers package-only and custom cache-manager doubles when
+     * a driver name is not available in the bound configuration repository.
+     *
+     * @param  string  $driver
+     * @param  mixed  $store
+     * @return bool
+     */
+    protected function isProcessLocalCacheStore($driver, $store)
+    {
+        if (in_array($driver, ['array', 'file', 'null'], true)) {
+            return true;
+        }
+
+        $underlying = is_object($store) && method_exists($store, 'getStore')
+            ? $store->getStore()
+            : $store;
+        if (! is_object($underlying)) {
+            return false;
+        }
+
+        $class = strtolower(get_class($underlying));
+
+        return strpos($class, '\\arraystore') !== false
+            || strpos($class, '\\filestore') !== false
+            || strpos($class, '\\nullstore') !== false;
+    }
+
+    /**
+     * Validate the lock contract on the underlying cache store instead of the
+     * repository facade, whose __call forwarding can create false positives.
+     *
+     * @param  mixed  $store
+     * @return bool
+     */
+    protected function supportsDistributedCacheLock($store)
+    {
+        $underlying = is_object($store) && method_exists($store, 'getStore')
+            ? $store->getStore()
+            : $store;
+
+        return $underlying instanceof LockProvider
+            || (is_object($underlying)
+                && method_exists($underlying, 'lock')
+                && method_exists($underlying, 'restoreLock'));
     }
 
     /**

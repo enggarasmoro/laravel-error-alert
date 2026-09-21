@@ -4,6 +4,7 @@ namespace Enggarasmoro\LaravelErrorAlert\Jobs;
 
 use Enggarasmoro\LaravelErrorAlert\Mail\ErrorAlertMail;
 use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
@@ -37,6 +38,9 @@ class SendErrorAlert implements ShouldQueue
     /** @var string|null */
     public $backlogCounterKey;
 
+    /** @var int|null */
+    public $backlogGenerationExpiresAt;
+
     /** @var string|null */
     public $cacheStore;
 
@@ -59,6 +63,7 @@ class SendErrorAlert implements ShouldQueue
         $this->backlogKey = isset($payload['backlog_key']) ? (string) $payload['backlog_key'] : null;
         $this->backlogGenerationKey = isset($payload['backlog_generation_key']) ? (string) $payload['backlog_generation_key'] : null;
         $this->backlogCounterKey = isset($payload['backlog_counter_key']) ? (string) $payload['backlog_counter_key'] : null;
+        $this->backlogGenerationExpiresAt = isset($payload['backlog_generation_expires_at']) ? (int) $payload['backlog_generation_expires_at'] : null;
         $this->cacheStore = isset($payload['cache_store']) ? (string) $payload['cache_store'] : null;
         $this->ownsBacklogReservation = (bool) $ownsBacklogReservation;
         $this->payload = $this->encrypted ? Crypt::encrypt($payload) : $payload;
@@ -133,16 +138,33 @@ class SendErrorAlert implements ShouldQueue
                 return;
             }
 
-            $released = method_exists($store, 'pull')
-                ? $store->pull($generationKey, null)
-                : $this->pullCacheKey($store, $generationKey);
-            if ($released === null) {
-                $this->backlogReleased = true;
+            $payloadExpiresAt = isset($payload['backlog_generation_expires_at'])
+                ? (int) $payload['backlog_generation_expires_at']
+                : (int) $this->backlogGenerationExpiresAt;
+            $this->withCacheLock($store, $counterKey.':release-lock', function () use ($store, $generationKey, $counterKey, $payloadExpiresAt) {
+                $released = $store->get($generationKey, null);
+                if ($released === null) {
+                    return;
+                }
+                if ($payloadExpiresAt > 0 && $payloadExpiresAt <= time()) {
+                    $store->forget($generationKey);
 
-                return;
-            }
+                    return;
+                }
 
-            $store->decrement($counterKey);
+                $store->forget($generationKey);
+                try {
+                    $store->decrement($counterKey);
+                } catch (\Throwable $exception) {
+                    try {
+                        $store->add($generationKey, $released, $this->backlogReleaseTtl($payloadExpiresAt));
+                    } catch (\Throwable $restoreException) {
+                        Log::error('error_alert_backlog_release_restore_failed', ['type' => get_class($restoreException)]);
+                    }
+
+                    throw $exception;
+                }
+            });
             $this->backlogReleased = true;
         } catch (\Throwable $ignored) {
             try {
@@ -156,16 +178,50 @@ class SendErrorAlert implements ShouldQueue
     /**
      * @param  mixed  $store
      * @param  string  $key
+     * @param  callable  $callback
      * @return mixed
      */
-    protected function pullCacheKey($store, $key)
+    protected function withCacheLock($store, $key, callable $callback)
     {
-        $value = $store->get($key, null);
-        if ($value !== null) {
-            $store->forget($key);
+        $underlying = is_object($store) && method_exists($store, 'getStore')
+            ? $store->getStore()
+            : $store;
+        $supportsLock = $underlying instanceof LockProvider
+            || (is_object($underlying)
+                && method_exists($underlying, 'lock')
+                && method_exists($underlying, 'restoreLock'));
+        if (! $supportsLock) {
+            return $callback();
         }
 
-        return $value;
+        $lock = $underlying->lock($key, 10);
+        if (is_object($lock) && method_exists($lock, 'block')) {
+            return $lock->block(1, $callback);
+        }
+        if (! is_object($lock) || ! method_exists($lock, 'get') || ! $lock->get()) {
+            throw new \RuntimeException('Unable to acquire the error alert backlog release lock.');
+        }
+
+        try {
+            return $callback();
+        } finally {
+            if (method_exists($lock, 'release')) {
+                $lock->release();
+            }
+        }
+    }
+
+    /**
+     * @param  int  $expiresAt
+     * @return int
+     */
+    protected function backlogReleaseTtl($expiresAt)
+    {
+        if ($expiresAt > 0) {
+            return max(1, $expiresAt - time());
+        }
+
+        return 86400;
     }
 
     /**

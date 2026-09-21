@@ -333,6 +333,52 @@ class ErrorAlertManagerTest extends TestCase
         $this->assertSame(['type' => \RuntimeException::class], $logger->errors[0][1]);
     }
 
+    public function test_backlog_release_can_retry_after_decrement_failure_and_is_idempotent(): void
+    {
+        $cache = new FakeCacheStore;
+        $app = new FakeApplication(false, ['enabled' => true, 'backlog_ttl' => 43200]);
+        $app['cache'] = new FakeCacheManager($cache);
+        $app['log'] = new FakeLogger;
+        $this->installFacades($app);
+        $manager = new ErrorAlertManager($app);
+        $payload = [
+            'fingerprint' => 'cleanup-retry',
+            'backlog_key' => 'alert-backlog',
+        ];
+        $this->assertTrue($this->invokeReservePayload($manager, $payload));
+
+        $cache->throwOnDecrement = true;
+        $manager->releaseBacklog($payload);
+        $this->assertSame(1, $cache->values[$payload['backlog_counter_key']]);
+
+        $cache->throwOnDecrement = false;
+        $manager->releaseBacklog($payload);
+        $this->assertSame(0, $cache->values[$payload['backlog_counter_key']]);
+
+        // A duplicate queue execution must not decrement another reservation.
+        $manager->releaseBacklog($payload);
+        $this->assertSame(0, $cache->values[$payload['backlog_counter_key']]);
+    }
+
+    public function test_backlog_release_uses_the_store_lock_when_available(): void
+    {
+        $cache = new LockingFakeCacheStore;
+        $app = new FakeApplication(false, ['enabled' => true]);
+        $app['cache'] = new FakeCacheManager($cache);
+        $this->installFacades($app);
+        $manager = new ErrorAlertManager($app);
+        $payload = [
+            'fingerprint' => 'lock-backed-release',
+            'backlog_key' => 'alert-backlog',
+        ];
+
+        $this->assertTrue($this->invokeReservePayload($manager, $payload));
+        $manager->releaseBacklog($payload);
+
+        $this->assertSame(1, $cache->lockCalls);
+        $this->assertSame(0, $cache->values[$payload['backlog_counter_key']]);
+    }
+
     public function test_rate_limit_cold_key_initialization_does_not_reset_a_concurrent_increment(): void
     {
         $cache = new FakeCacheStore;
@@ -519,6 +565,7 @@ class ErrorAlertManagerTest extends TestCase
 
     public function test_check_command_warns_for_plaintext_queue_payloads_in_production(): void
     {
+        $store = new LockingFakeCacheStore;
         $tester = $this->checkCommand([
             'error-alert' => [
                 'recipients' => ['ops@example.test'],
@@ -531,12 +578,44 @@ class ErrorAlertManagerTest extends TestCase
             'queue.default' => 'redis',
             'queue.connections' => ['redis' => ['driver' => 'redis']],
             'cache.default' => 'redis',
-            'cache.stores' => ['redis' => ['driver' => 'array']],
-        ], 'production');
+            'cache.stores' => ['redis' => ['driver' => 'redis']],
+        ], 'production', $store);
 
         $this->assertSame(0, $tester->execute([]));
         $this->assertStringContainsString('WARNING:', $tester->getDisplay());
         $this->assertStringContainsString('payload encryption is disabled', $tester->getDisplay());
+    }
+
+    public function test_check_command_rejects_process_local_cache_store_in_production(): void
+    {
+        $tester = $this->checkCommand([
+            'error-alert' => [
+                'recipients' => ['ops@example.test'],
+                'delivery' => 'sync',
+                'cache_store' => 'array',
+            ],
+            'cache.default' => 'array',
+            'cache.stores' => ['array' => ['driver' => 'array']],
+        ], 'production');
+
+        $this->assertSame(1, $tester->execute([]));
+        $this->assertStringContainsString('shared', $tester->getDisplay());
+    }
+
+    public function test_check_command_rejects_production_cache_without_distributed_lock_contract(): void
+    {
+        $tester = $this->checkCommand([
+            'error-alert' => [
+                'recipients' => ['ops@example.test'],
+                'delivery' => 'sync',
+                'cache_store' => 'redis',
+            ],
+            'cache.default' => 'redis',
+            'cache.stores' => ['redis' => ['driver' => 'redis']],
+        ], 'production', new FakeCacheStore);
+
+        $this->assertSame(1, $tester->execute([]));
+        $this->assertStringContainsString('distributed lock', $tester->getDisplay());
     }
 
     public function test_check_command_reads_configuration_from_its_bound_application(): void
@@ -1027,6 +1106,64 @@ class FakeCacheStore
         if ($seconds !== null) {
             $this->ttls[$key] = $seconds;
         }
+    }
+}
+
+class LockingFakeCacheStore extends FakeCacheStore implements \Illuminate\Contracts\Cache\LockProvider
+{
+    public $lockCalls = 0;
+
+    public function lock($name, $seconds = 0, $owner = null)
+    {
+        $this->lockCalls++;
+
+        return new FakeCacheLock($name, $owner ?: 'fake-owner');
+    }
+
+    public function restoreLock($name, $owner)
+    {
+        return new FakeCacheLock($name, $owner);
+    }
+}
+
+class FakeCacheLock implements \Illuminate\Contracts\Cache\Lock
+{
+    private $name;
+
+    private $owner;
+
+    public function __construct($name, $owner)
+    {
+        $this->name = $name;
+        $this->owner = $owner;
+    }
+
+    public function get($callback = null)
+    {
+        if ($callback !== null) {
+            return $callback();
+        }
+
+        return true;
+    }
+
+    public function block($seconds, $callback = null)
+    {
+        return $callback !== null ? $callback() : true;
+    }
+
+    public function release()
+    {
+        return true;
+    }
+
+    public function owner()
+    {
+        return $this->owner;
+    }
+
+    public function forceRelease()
+    {
     }
 }
 

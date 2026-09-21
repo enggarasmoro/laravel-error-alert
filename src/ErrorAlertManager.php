@@ -4,6 +4,7 @@ namespace Enggarasmoro\LaravelErrorAlert;
 
 use Enggarasmoro\LaravelErrorAlert\Events\AlertRequested;
 use Enggarasmoro\LaravelErrorAlert\Jobs\SendErrorAlert;
+use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Support\Facades\Cache;
 use Symfony\Component\HttpKernel\Exception\HttpExceptionInterface;
 use Throwable;
@@ -240,6 +241,7 @@ class ErrorAlertManager
         $backlogKey = $payload['backlog_key'];
         $generation = bin2hex(random_bytes(16));
         $generationKey = $backlogKey.':generation:'.$generation;
+        $generationExpiresAt = time() + (int) $config['backlog_ttl'];
         $counterIncremented = false;
 
         try {
@@ -261,6 +263,7 @@ class ErrorAlertManager
             $payload['backlog_generation'] = $generation;
             $payload['backlog_generation_key'] = $generationKey;
             $payload['backlog_counter_key'] = $backlogKey;
+            $payload['backlog_generation_expires_at'] = $generationExpiresAt;
 
             return true;
         } catch (Throwable $exception) {
@@ -296,32 +299,118 @@ class ErrorAlertManager
                 return;
             }
 
-            $released = method_exists($cache, 'pull')
-                ? $cache->pull($generationKey, null)
-                : $this->pullCacheKey($cache, $generationKey);
-            if ($released === null) {
-                return;
-            }
+            $this->withCacheLock($cache, $counterKey.':release-lock', function () use ($cache, $generationKey, $counterKey, $payload, $config) {
+                $released = $cache->get($generationKey, null);
+                if ($released === null) {
+                    return;
+                }
 
-            $cache->decrement($counterKey);
+                $expiresAt = isset($payload['backlog_generation_expires_at'])
+                    ? (int) $payload['backlog_generation_expires_at']
+                    : 0;
+                if ($expiresAt > 0 && $expiresAt <= time()) {
+                    $cache->forget($generationKey);
+
+                    return;
+                }
+
+                $cache->forget($generationKey);
+                try {
+                    $cache->decrement($counterKey);
+                } catch (Throwable $exception) {
+                    try {
+                        $cache->add(
+                            $generationKey,
+                            $released,
+                            $this->backlogReleaseTtl($payload, $config, $expiresAt)
+                        );
+                    } catch (Throwable $restoreException) {
+                        $this->log('error_alert_backlog_release_restore_failed', ['type' => get_class($restoreException)]);
+                    }
+
+                    throw $exception;
+                }
+            });
         } catch (Throwable $exception) {
             $this->log('error_alert_backlog_release_failed', ['type' => get_class($exception)]);
         }
     }
 
     /**
+     * Execute a cache mutation under the store's distributed lock when one is
+     * available. Production preflight rejects stores without this contract;
+     * the fallback keeps local/testing stores compatible with Laravel 6.
+     *
      * @param  mixed  $cache
      * @param  string  $key
+     * @param  callable  $callback
      * @return mixed
      */
-    protected function pullCacheKey($cache, $key)
+    protected function withCacheLock($cache, $key, callable $callback)
     {
-        $value = $cache->get($key, null);
-        if ($value !== null) {
-            $cache->forget($key);
+        $store = $this->underlyingCacheStore($cache);
+        if (! $this->supportsCacheLock($store)) {
+            return $callback();
         }
 
-        return $value;
+        $lock = $store->lock($key, 10);
+        if (is_object($lock) && method_exists($lock, 'block')) {
+            return $lock->block(1, $callback);
+        }
+        if (! is_object($lock) || ! method_exists($lock, 'get') || ! $lock->get()) {
+            throw new \RuntimeException('Unable to acquire the error alert backlog release lock.');
+        }
+
+        try {
+            return $callback();
+        } finally {
+            if (method_exists($lock, 'release')) {
+                $lock->release();
+            }
+        }
+    }
+
+    /**
+     * @param  mixed  $cache
+     * @return mixed
+     */
+    protected function underlyingCacheStore($cache)
+    {
+        if (is_object($cache) && method_exists($cache, 'getStore')) {
+            return $cache->getStore();
+        }
+
+        return $cache;
+    }
+
+    /**
+     * @param  mixed  $store
+     * @return bool
+     */
+    protected function supportsCacheLock($store)
+    {
+        return $store instanceof LockProvider
+            || (is_object($store)
+                && method_exists($store, 'lock')
+                && method_exists($store, 'restoreLock'));
+    }
+
+    /**
+     * @param  array<string, mixed>  $payload
+     * @param  array<string, mixed>  $config
+     * @param  int  $expiresAt
+     * @return int
+     */
+    protected function backlogReleaseTtl(array $payload, array $config, $expiresAt)
+    {
+        if ($expiresAt <= 0 && isset($payload['backlog_generation_expires_at'])) {
+            $expiresAt = (int) $payload['backlog_generation_expires_at'];
+        }
+        if ($expiresAt > 0) {
+            return max(1, $expiresAt - time());
+        }
+
+        return max(1, (int) $config['backlog_ttl']);
     }
 
     /**
