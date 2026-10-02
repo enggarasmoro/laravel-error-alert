@@ -1,0 +1,111 @@
+name: Package CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '17 7 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: PHP ${{ matrix.php }} / Illuminate ${{ matrix.illuminate }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - php: '7.2'
+            illuminate: '6.20.*'
+          - php: '8.4'
+            illuminate: '13.*'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0 (Node 24)
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+          tools: composer:v2
+
+      - name: Validate Composer manifest
+        run: composer validate --strict
+
+      # Laravel 6 resolves to EOL dependencies with published advisories. Relax
+      # security blocking only for this ephemeral compatibility lane.
+      - name: Install legacy compatibility dependencies
+        if: matrix.php == '7.2'
+        run: composer update --with "illuminate/support:${{ matrix.illuminate }}" --prefer-dist --no-interaction --no-progress --no-security-blocking
+        env:
+          COMPOSER_NO_SECURITY_BLOCKING: '1'
+
+      - name: Install current framework dependencies
+        if: matrix.php == '8.4'
+        run: composer update --prefer-dist --no-interaction --no-progress
+
+      # Keep the framework components on one patch line. Pinning only support
+      # can produce an invalid mixed Illuminate tree as new patch versions ship.
+      - name: Verify current Illuminate patch alignment
+        if: matrix.php == '8.4'
+        run: |
+          package_version() {
+            php -d display_errors=0 -r '$lock = json_decode(file_get_contents("composer.lock"), true); foreach (array_merge($lock["packages"] ?? [], $lock["packages-dev"] ?? []) as $package) { if (($package["name"] ?? "") === $argv[1]) { echo $package["version"] ?? ""; exit; } } fwrite(STDERR, "Package not found: ".$argv[1].PHP_EOL); exit(1);' "$1"
+          }
+          support_version="$(package_version illuminate/support)"
+          mail_version="$(package_version illuminate/mail)"
+          view_version="$(package_version illuminate/view)"
+          support_version="${support_version#v}"
+          mail_version="${mail_version#v}"
+          view_version="${view_version#v}"
+          case "$support_version" in 13.*) ;; *) echo "Unexpected illuminate/support version: $support_version"; exit 1 ;; esac
+          if [ "$support_version" != "$mail_version" ] || [ "$support_version" != "$view_version" ]; then
+            echo "Mixed Illuminate versions: support=$support_version mail=$mail_version view=$view_version"
+            exit 1
+          fi
+
+      - name: Lint PHP files
+        run: |
+          set -e
+          while IFS= read -r -d '' file; do
+            php -l "$file" >/dev/null
+          done < <(find src tests -type f -name '*.php' -print0)
+
+      - name: Run package tests
+        run: composer test
+
+      - name: Run static analysis
+        run: composer analyse
+
+      # Laravel 6 compatibility requires EOL dependency versions. Keep this
+      # lane visible without making the legacy advisory set block delivery;
+      # the current PHP/Laravel lane below remains blocking.
+      - name: Audit legacy dependency advisories (informational)
+        if: matrix.php == '7.2'
+        continue-on-error: true
+        run: composer audit --locked --no-dev
+
+      - name: Audit locked production dependencies
+        if: matrix.php == '8.4'
+        run: composer audit --locked --no-dev
+
+      - name: Install CycloneDX Composer plugin
+        if: matrix.php == '8.4'
+        run: |
+          composer global config --no-plugins allow-plugins.cyclonedx/cyclonedx-php-composer true
+          composer global require --no-interaction --no-progress cyclonedx/cyclonedx-php-composer:6.2.0
+
+      - name: Generate CycloneDX SBOM
+        if: matrix.php == '8.4'
+        run: composer CycloneDX:make-sbom --output-format=JSON --output-file=sbom.json --omit=dev --validate
+
+      - name: Upload SBOM artifact
+        if: matrix.php == '8.4'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0 (Node 24)
+        with:
+          name: laravel-error-alert-sbom
+          path: sbom.json
+          if-no-files-found: error
