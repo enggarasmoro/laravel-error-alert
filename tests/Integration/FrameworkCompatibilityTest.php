@@ -6,6 +6,8 @@ use Enggarasmoro\LaravelErrorAlert\ErrorAlertManager;
 use Enggarasmoro\LaravelErrorAlert\Jobs\SendErrorAlert;
 use Enggarasmoro\LaravelErrorAlert\Mail\ErrorAlertMail;
 use Illuminate\Cache\CacheManager;
+use Illuminate\Cache\Repository;
+use Illuminate\Cache\RedisStore;
 use Illuminate\Container\Container;
 use Illuminate\Encryption\Encrypter;
 use Illuminate\Events\Dispatcher;
@@ -18,6 +20,7 @@ use Illuminate\View\Engines\CompilerEngine;
 use Illuminate\View\Engines\EngineResolver;
 use Illuminate\View\Factory;
 use Illuminate\View\FileViewFinder;
+use Illuminate\Redis\RedisManager;
 use PHPUnit\Framework\TestCase;
 
 class FrameworkCompatibilityTest extends TestCase
@@ -124,6 +127,163 @@ class FrameworkCompatibilityTest extends TestCase
         $this->assertSame($payload, $resolved->invoke($job));
         $this->assertSame('integration-backlog:generation:abc', $job->backlogGenerationKey);
         $this->assertSame('integration-backlog', $job->backlogCounterKey);
+    }
+
+    public function test_real_redis_release_commits_before_a_worker_crash_and_is_idempotent(): void
+    {
+        if (getenv('ERROR_ALERT_TEST_REDIS') !== '1' || ! class_exists(RedisManager::class) || ! function_exists('pcntl_fork')) {
+            $this->markTestSkipped('Real Redis release test requires the Laravel Redis component, pcntl, and ERROR_ALERT_TEST_REDIS=1.');
+        }
+
+        $runId = bin2hex(random_bytes(8));
+        $service = 'release-test-'.$runId;
+        $prefix = 'error-alert-test:'.$runId.':';
+        $config = new IntegrationConfig([
+            'error-alert' => [
+                'enabled' => true,
+                'environments' => ['testing'],
+                'service' => $service,
+                'cache_store' => 'redis',
+                'cooldown' => 60,
+                'max_per_hour' => 5,
+                'max_backlog' => 5,
+                'backlog_ttl' => 60,
+            ],
+            'cache.default' => 'redis',
+            'cache.prefix' => $prefix,
+            'cache.stores.redis' => ['driver' => 'redis', 'connection' => 'default', 'prefix' => $prefix],
+        ]);
+        $app = new IntegrationApplication;
+        $app->instance('config', $config);
+        $app->instance('redis', new RedisManager($app, 'phpredis', [
+            'default' => [
+                'host' => getenv('REDIS_HOST') ?: 'redis',
+                'port' => (int) (getenv('REDIS_PORT') ?: 6379),
+                'password' => getenv('REDIS_PASSWORD') ?: null,
+                'database' => (int) (getenv('REDIS_DB') ?: 0),
+            ],
+        ]));
+        $cache = new CacheManager($app);
+        $app->instance('cache', $cache);
+        Container::setInstance($app);
+        Cache::swap($cache);
+
+        $manager = new ErrorAlertManager($app);
+        $payload = [
+            'fingerprint' => 'release-'.$runId,
+            'backlog_key' => 'enggarasmoro:error-alert:backlog:{'.sha1($service.'|testing').'}',
+        ];
+        $reserve = new \ReflectionMethod($manager, 'reserve');
+        $reserve->setAccessible(true);
+        $store = $cache->store('redis');
+
+        try {
+            $this->assertTrue((bool) $reserve->invokeArgs($manager, [&$payload]));
+            $this->assertSame(1, (int) $store->get($payload['backlog_key']));
+
+            $child = pcntl_fork();
+            $this->assertNotSame(-1, $child);
+            if ($child === 0) {
+                $redisStore = $store->getStore();
+                $crashStore = new CrashAfterAtomicEvalRedisStore($redisStore->getRedis(), $redisStore->getPrefix());
+                Cache::swap(new CrashAfterAtomicEvalCacheManager(new Repository($crashStore)));
+                (new ErrorAlertManager($app))->releaseBacklog($payload);
+                exit(0);
+            }
+
+            pcntl_waitpid($child, $status);
+            $this->assertTrue(pcntl_wifexited($status));
+            $this->assertSame(47, pcntl_wexitstatus($status), 'Worker must exit immediately after the atomic Redis release.');
+            Cache::swap($cache);
+            $manager->releaseBacklog($payload);
+            $manager->releaseBacklog($payload);
+
+            $this->assertSame(0, (int) $store->get($payload['backlog_key']));
+            $this->assertNull($store->get($payload['backlog_generation_key']));
+
+            $secondPayload = [
+                'fingerprint' => 'job-release-'.$runId,
+                'backlog_key' => $payload['backlog_key'],
+                'cache_store' => 'redis',
+            ];
+            $this->assertTrue((bool) $reserve->invokeArgs($manager, [&$secondPayload]));
+            $releaseJob = new \ReflectionMethod(SendErrorAlert::class, 'releaseBacklog');
+            $releaseJob->setAccessible(true);
+            $releaseJob->invoke(new SendErrorAlert($secondPayload, 'redis', 'error-alerts', false, true));
+            $releaseJob->invoke(new SendErrorAlert($secondPayload, 'redis', 'error-alerts', false, true));
+
+            $this->assertSame(0, (int) $store->get($payload['backlog_key']));
+            $this->assertNull($store->get($secondPayload['backlog_generation_key']));
+
+            $legacyPayload = [
+                'fingerprint' => 'legacy-release-'.$runId,
+                'backlog_key' => 'enggarasmoro:error-alert:backlog:'.sha1($service.'|testing'),
+            ];
+            $this->assertTrue((bool) $reserve->invokeArgs($manager, [&$legacyPayload]));
+            $manager->releaseBacklog($legacyPayload);
+            $this->assertSame(0, (int) $store->get($legacyPayload['backlog_key']));
+            $this->assertNull($store->get($legacyPayload['backlog_generation_key']));
+        } finally {
+            Cache::swap($cache);
+            $store->forget('enggarasmoro:error-alert:fingerprint:'.sha1($payload['fingerprint']));
+            $store->forget('enggarasmoro:error-alert:fingerprint:'.sha1('job-release-'.$runId));
+            $store->forget('enggarasmoro:error-alert:fingerprint:'.sha1('legacy-release-'.$runId));
+            $store->forget('enggarasmoro:error-alert:rate:'.sha1($service.'|testing'));
+            $store->forget($payload['backlog_key']);
+            if (isset($payload['backlog_generation_key'])) {
+                $store->forget($payload['backlog_generation_key']);
+            }
+            if (isset($secondPayload['backlog_generation_key'])) {
+                $store->forget($secondPayload['backlog_generation_key']);
+            }
+            $store->forget($payload['backlog_key'].':release-lock');
+            if (isset($legacyPayload['backlog_key'])) {
+                $store->forget($legacyPayload['backlog_key']);
+                $store->forget($legacyPayload['backlog_key'].':release-lock');
+            }
+            if (isset($legacyPayload['backlog_generation_key'])) {
+                $store->forget($legacyPayload['backlog_generation_key']);
+            }
+        }
+    }
+}
+
+class CrashAfterAtomicEvalCacheManager
+{
+    private $store;
+
+    public function __construct(Repository $store)
+    {
+        $this->store = $store;
+    }
+
+    public function store($name = null)
+    {
+        return $this->store;
+    }
+}
+
+class CrashAfterAtomicEvalRedisStore extends RedisStore
+{
+    public function connection()
+    {
+        return new CrashAfterAtomicEvalConnection(parent::connection());
+    }
+}
+
+class CrashAfterAtomicEvalConnection
+{
+    private $connection;
+
+    public function __construct($connection)
+    {
+        $this->connection = $connection;
+    }
+
+    public function eval($script, $numberOfKeys, ...$arguments)
+    {
+        $this->connection->eval($script, $numberOfKeys, ...$arguments);
+        exit(47);
     }
 }
 

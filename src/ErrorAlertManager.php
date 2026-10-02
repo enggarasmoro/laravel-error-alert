@@ -299,6 +299,13 @@ class ErrorAlertManager
                 return;
             }
 
+            $expiresAt = isset($payload['backlog_generation_expires_at'])
+                ? (int) $payload['backlog_generation_expires_at']
+                : 0;
+            if (RedisBacklogRelease::releaseIfSupported($cache, $generationKey, $counterKey, $expiresAt)) {
+                return;
+            }
+
             $this->withCacheLock($cache, $counterKey.':release-lock', function () use ($cache, $generationKey, $counterKey, $payload, $config) {
                 $released = $cache->get($generationKey, null);
                 if ($released === null) {
@@ -476,7 +483,7 @@ class ErrorAlertManager
             'recipients' => $recipients,
             'mailer' => $mailer,
             'cache_store' => $cacheStore,
-            'backlog_key' => 'enggarasmoro:error-alert:backlog:'.sha1($service.'|'.$environment),
+            'backlog_key' => 'enggarasmoro:error-alert:backlog:{'.sha1($service.'|'.$environment).'}',
         ];
     }
 

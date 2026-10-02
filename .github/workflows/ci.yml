@@ -20,7 +20,7 @@ jobs:
           - php: '7.2'
             illuminate: '6.20.*'
           - php: '8.4'
-            illuminate: '13.32.*'
+            illuminate: '13.*'
     steps:
       - name: Check out source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0 (Node 24)
@@ -45,11 +45,10 @@ jobs:
 
       - name: Install current framework dependencies
         if: matrix.php == '8.4'
-        run: composer update --with "illuminate/support:${{ matrix.illuminate }}" --prefer-dist --no-interaction --no-progress
+        run: composer update --prefer-dist --no-interaction --no-progress
 
       # Keep the framework components on one patch line. Pinning only support
-      # to 13.0 while Composer resolves mail at 13.32 can produce an invalid
-      # mixed Illuminate tree and a fatal Mailable trait load during PHPUnit.
+      # can produce an invalid mixed Illuminate tree as new patch versions ship.
       - name: Verify current Illuminate patch alignment
         if: matrix.php == '8.4'
         run: |
@@ -58,10 +57,15 @@ jobs:
           }
           support_version="$(package_version illuminate/support)"
           mail_version="$(package_version illuminate/mail)"
+          view_version="$(package_version illuminate/view)"
           support_version="${support_version#v}"
           mail_version="${mail_version#v}"
-          case "$support_version" in 13.32.*) ;; *) echo "Unexpected illuminate/support version: $support_version"; exit 1 ;; esac
-          case "$mail_version" in 13.32.*) ;; *) echo "Unexpected illuminate/mail version: $mail_version"; exit 1 ;; esac
+          view_version="${view_version#v}"
+          case "$support_version" in 13.*) ;; *) echo "Unexpected illuminate/support version: $support_version"; exit 1 ;; esac
+          if [ "$support_version" != "$mail_version" ] || [ "$support_version" != "$view_version" ]; then
+            echo "Mixed Illuminate versions: support=$support_version mail=$mail_version view=$view_version"
+            exit 1
+          fi
 
       - name: Lint PHP files
         run: |

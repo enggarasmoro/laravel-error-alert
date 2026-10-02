@@ -2,6 +2,7 @@
 
 namespace Enggarasmoro\LaravelErrorAlert\Jobs;
 
+use Enggarasmoro\LaravelErrorAlert\RedisBacklogRelease;
 use Enggarasmoro\LaravelErrorAlert\Mail\ErrorAlertMail;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Cache\LockProvider;
@@ -141,6 +142,11 @@ class SendErrorAlert implements ShouldQueue
             $payloadExpiresAt = isset($payload['backlog_generation_expires_at'])
                 ? (int) $payload['backlog_generation_expires_at']
                 : (int) $this->backlogGenerationExpiresAt;
+            if (RedisBacklogRelease::releaseIfSupported($store, $generationKey, $counterKey, $payloadExpiresAt)) {
+                $this->backlogReleased = true;
+
+                return;
+            }
             $this->withCacheLock($store, $counterKey.':release-lock', function () use ($store, $generationKey, $counterKey, $payloadExpiresAt) {
                 $released = $store->get($generationKey, null);
                 if ($released === null) {
