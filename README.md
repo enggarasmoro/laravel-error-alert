@@ -41,7 +41,21 @@ Pada mode queue, package menolak konfigurasi kosong, koneksi yang tidak dikenal,
 php artisan queue:work redis --queue=inspection-api.error-alerts --tries=3 --timeout=30
 ```
 
-Validasi tanpa mengirim email dengan `php artisan error-alert:check`. Command ini membuat key cache unik ber-TTL 60 detik lalu menguji `add`, `increment`, `put`, `decrement`, dan `get` yang dipakai untuk reservation alert; key probe dihapus sesudahnya dan otomatis kedaluwarsa bila cleanup gagal. Gunakan `php artisan error-alert:test` hanya ketika email uji memang diinginkan.
+Validasi tanpa mengirim email dengan `php artisan error-alert:check`. Command ini membuat key cache unik ber-TTL 60 detik lalu menguji `add`, `increment`, `put`, `decrement`, dan `get` yang dipakai untuk reservation alert; key probe dihapus sesudahnya dan otomatis kedaluwarsa bila cleanup gagal.
+
+Untuk memverifikasi email nyata di development atau production, jalankan command secara manual pada aplikasi yang ingin diuji:
+
+```bash
+# Mengikuti ERROR_ALERT_DELIVERY dan mengirim ke penerima yang dikonfigurasi.
+php artisan error-alert:test
+
+# Mengirim langsung tanpa queue, hanya untuk probe ini, dan hanya ke inbox uji.
+php artisan error-alert:test --sync --to=alerts@example.com
+```
+
+Command membuat exception uji yang aman dan bertanda unik, lalu menjalankannya melalui pipeline delivery package. `--to` membatasi probe ke satu alamat valid dan tidak mengubah `.env`; `--sync` hanya mengubah delivery untuk proses command tersebut. Pastikan `ERROR_ALERT_ENABLED=true`, environment saat ini termasuk di `ERROR_ALERT_ENVIRONMENTS`, dan alamat tujuan sudah benar sebelum menjalankannya. Ini pengiriman sungguhan ke alamat yang dipilih, jadi jangan tambahkan command ini ke deploy atau CI otomatis.
+
+Dengan delivery `queue`, output sukses hanya berarti job berhasil diantrekan; worker pada queue `ERROR_ALERT_QUEUE` tetap harus berjalan sebelum email dikirim. Gunakan `--sync` untuk memeriksa mailer tanpa bergantung pada worker. Output sukses mode sync berarti mailer menerima pengiriman, bukan jaminan pesan masuk inbox utama—periksa juga spam dan status provider email.
 
 `ERROR_ALERT_MAILER` hanya berlaku pada versi/configurasi Laravel yang menyediakan named mailer. Pada instalasi Laravel 6 dengan satu mailer default, biarkan variabel ini kosong dan gunakan konfigurasi mailer bawaan Laravel; `error-alert:check` akan menandai konfigurasi named mailer yang tidak didukung.
 
