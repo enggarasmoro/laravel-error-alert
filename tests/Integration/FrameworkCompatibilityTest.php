@@ -64,6 +64,7 @@ class FrameworkCompatibilityTest extends TestCase
         $this->assertTrue((bool) $reserve->invokeArgs($manager, [&$payload]));
         $this->assertSame(1, $cache->get('integration-backlog'));
         $this->assertSame(1, $cache->get($payload['backlog_generation_key']));
+        $this->assertSame($payload['backlog_counter_generation'], $cache->get('integration-backlog:counter-generation'));
 
         $manager->releaseBacklog($payload);
 
@@ -118,6 +119,7 @@ class FrameworkCompatibilityTest extends TestCase
             'backlog_key' => 'integration-backlog',
             'backlog_generation_key' => 'integration-backlog:generation:abc',
             'backlog_counter_key' => 'integration-backlog',
+            'backlog_counter_generation' => 'counter-incarnation-123',
         ];
         $job = new SendErrorAlert($payload, 'redis', 'error-alerts', true, true);
         $resolved = new \ReflectionMethod($job, 'resolvedPayload');
@@ -127,6 +129,7 @@ class FrameworkCompatibilityTest extends TestCase
         $this->assertSame($payload, $resolved->invoke($job));
         $this->assertSame('integration-backlog:generation:abc', $job->backlogGenerationKey);
         $this->assertSame('integration-backlog', $job->backlogCounterKey);
+        $this->assertSame('counter-incarnation-123', $job->backlogCounterGeneration);
     }
 
     public function test_real_redis_release_commits_before_a_worker_crash_and_is_idempotent(): void
@@ -145,7 +148,7 @@ class FrameworkCompatibilityTest extends TestCase
                 'service' => $service,
                 'cache_store' => 'redis',
                 'cooldown' => 60,
-                'max_per_hour' => 5,
+                'max_per_hour' => 20,
                 'max_backlog' => 5,
                 'backlog_ttl' => 60,
             ],
@@ -180,6 +183,19 @@ class FrameworkCompatibilityTest extends TestCase
         try {
             $this->assertTrue((bool) $reserve->invokeArgs($manager, [&$payload]));
             $this->assertSame(1, (int) $store->get($payload['backlog_key']));
+            $redisStore = $store->getStore();
+            $rawGeneration = $redisStore->connection()->get(
+                $redisStore->getPrefix().$payload['backlog_key'].':counter-generation'
+            );
+            $this->assertSame($payload['backlog_counter_generation'], $rawGeneration);
+            $redisStore->connection()->set(
+                $redisStore->getPrefix().$payload['backlog_key'].':counter-generation',
+                serialize($payload['backlog_counter_generation'])
+            );
+            $this->assertSame(
+                $payload['backlog_counter_generation'],
+                $store->get($payload['backlog_key'].':counter-generation')
+            );
 
             $child = pcntl_fork();
             $this->assertNotSame(-1, $child);
@@ -223,23 +239,70 @@ class FrameworkCompatibilityTest extends TestCase
             $manager->releaseBacklog($legacyPayload);
             $this->assertSame(0, (int) $store->get($legacyPayload['backlog_key']));
             $this->assertNull($store->get($legacyPayload['backlog_generation_key']));
+
+            $firstPayload = [
+                'fingerprint' => 'first-stagger-'.$runId,
+                'backlog_key' => $payload['backlog_key'],
+                'cache_store' => 'redis',
+            ];
+            $stalePayload = [
+                'fingerprint' => 'stale-stagger-'.$runId,
+                'backlog_key' => $payload['backlog_key'],
+                'cache_store' => 'redis',
+            ];
+            $this->assertTrue((bool) $reserve->invokeArgs($manager, [&$firstPayload]));
+            $this->assertTrue((bool) $reserve->invokeArgs($manager, [&$stalePayload]));
+            $oldCounterGeneration = $stalePayload['backlog_counter_generation'];
+            $store->forget($stalePayload['backlog_counter_key']);
+
+            $recreatedPayload = [
+                'fingerprint' => 'recreated-stagger-'.$runId,
+                'backlog_key' => $payload['backlog_key'],
+                'cache_store' => 'redis',
+            ];
+            $this->assertTrue((bool) $reserve->invokeArgs($manager, [&$recreatedPayload]));
+            $this->assertNotSame($oldCounterGeneration, $recreatedPayload['backlog_counter_generation']);
+            $this->assertSame(1, (int) $store->get($recreatedPayload['backlog_counter_key']));
+
+            $manager->releaseBacklog($firstPayload);
+            $manager->releaseBacklog($stalePayload);
+            $this->assertSame(1, (int) $store->get($recreatedPayload['backlog_counter_key']));
+            $this->assertNull($store->get($firstPayload['backlog_generation_key']));
+            $this->assertNull($store->get($stalePayload['backlog_generation_key']));
+            $manager->releaseBacklog($recreatedPayload);
+            $this->assertSame(0, (int) $store->get($recreatedPayload['backlog_counter_key']));
         } finally {
             Cache::swap($cache);
             $store->forget('enggarasmoro:error-alert:fingerprint:'.sha1($payload['fingerprint']));
             $store->forget('enggarasmoro:error-alert:fingerprint:'.sha1('job-release-'.$runId));
             $store->forget('enggarasmoro:error-alert:fingerprint:'.sha1('legacy-release-'.$runId));
+            $store->forget('enggarasmoro:error-alert:fingerprint:'.sha1('first-stagger-'.$runId));
+            $store->forget('enggarasmoro:error-alert:fingerprint:'.sha1('stale-stagger-'.$runId));
+            $store->forget('enggarasmoro:error-alert:fingerprint:'.sha1('recreated-stagger-'.$runId));
             $store->forget('enggarasmoro:error-alert:rate:'.sha1($service.'|testing'));
             $store->forget($payload['backlog_key']);
+            $store->forget($payload['backlog_key'].':counter-generation');
+            $store->forget($payload['backlog_key'].':reservation-lock');
             if (isset($payload['backlog_generation_key'])) {
                 $store->forget($payload['backlog_generation_key']);
             }
             if (isset($secondPayload['backlog_generation_key'])) {
                 $store->forget($secondPayload['backlog_generation_key']);
             }
+            if (isset($firstPayload['backlog_generation_key'])) {
+                $store->forget($firstPayload['backlog_generation_key']);
+            }
+            if (isset($stalePayload['backlog_generation_key'])) {
+                $store->forget($stalePayload['backlog_generation_key']);
+            }
+            if (isset($recreatedPayload['backlog_generation_key'])) {
+                $store->forget($recreatedPayload['backlog_generation_key']);
+            }
             $store->forget($payload['backlog_key'].':release-lock');
             if (isset($legacyPayload['backlog_key'])) {
                 $store->forget($legacyPayload['backlog_key']);
-                $store->forget($legacyPayload['backlog_key'].':release-lock');
+                $store->forget($legacyPayload['backlog_key'].':counter-generation');
+                $store->forget($legacyPayload['backlog_key'].':reservation-lock');
             }
             if (isset($legacyPayload['backlog_generation_key'])) {
                 $store->forget($legacyPayload['backlog_generation_key']);

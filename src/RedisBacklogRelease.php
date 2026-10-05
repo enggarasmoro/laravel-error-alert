@@ -13,15 +13,19 @@ final class RedisBacklogRelease
      * @param  mixed  $cache
      * @param  string  $generationKey
      * @param  string  $counterKey
+     * @param  string  $counterGeneration
      * @param  int  $expiresAt
-     * @return bool  Whether this cache uses the Redis implementation.
+     * @return bool  Whether Redis handled the release atomically.
      */
-    public static function releaseIfSupported($cache, $generationKey, $counterKey, $expiresAt)
+    public static function releaseIfSupported($cache, $generationKey, $counterKey, $counterGeneration, $expiresAt)
     {
         $store = is_object($cache) && method_exists($cache, 'getStore')
             ? $cache->getStore()
             : $cache;
         if (! $store instanceof RedisStore) {
+            return false;
+        }
+        if (! is_string($counterGeneration) || $counterGeneration === '') {
             return false;
         }
         // Jobs queued before the hash-tagged key rollout must use the legacy
@@ -43,6 +47,12 @@ if redis.call('exists', KEYS[2]) == 0 then
     redis.call('del', KEYS[1])
     return 0
 end
+local counterGeneration = redis.call('get', KEYS[3])
+if counterGeneration ~= ARGV[3] and counterGeneration ~= ARGV[4] then
+    -- A framework or Redis client may serialize the cache value differently.
+    -- Let the caller compare through Cache::get while holding its cache lock.
+    return -1
+end
 local count = tonumber(redis.call('get', KEYS[2]))
 if count == nil or count <= 0 then
     redis.call('del', KEYS[1])
@@ -54,21 +64,24 @@ return 1
 LUA;
 
         $connection = $store->connection();
-        if (! is_object($connection) || ! is_callable([$connection, 'eval'])) {
+        if (! is_callable([$connection, 'eval'])) {
             throw new \RuntimeException('Redis cache connection does not support atomic backlog release.');
         }
         $result = call_user_func_array([$connection, 'eval'], [
             $script,
-            2,
+            3,
             $store->getPrefix().$generationKey,
             $store->getPrefix().$counterKey,
+            $store->getPrefix().$counterKey.':counter-generation',
             (int) $expiresAt,
             time(),
+            $counterGeneration,
+            serialize($counterGeneration),
         ]);
         if (! is_numeric($result)) {
             throw new \RuntimeException('Redis backlog release did not complete.');
         }
 
-        return true;
+        return (int) $result !== -1;
     }
 }

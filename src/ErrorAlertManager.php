@@ -241,43 +241,78 @@ class ErrorAlertManager
         $backlogKey = $payload['backlog_key'];
         $generation = bin2hex(random_bytes(16));
         $generationKey = $backlogKey.':generation:'.$generation;
+        $counterGenerationKey = $backlogKey.':counter-generation';
         $generationExpiresAt = time() + (int) $config['backlog_ttl'];
-        $counterIncremented = false;
+        $reservation = $this->withCacheLock($cache, $backlogKey.':reservation-lock', function () use (
+            $cache,
+            $backlogKey,
+            $counterGenerationKey,
+            $generationKey,
+            $config,
+            &$payload
+        ) {
+            $counter = $cache->get($backlogKey, null);
+            $counterGeneration = $cache->get($counterGenerationKey, null);
 
-        try {
+            if ($counter === null || ! is_string($counterGeneration) || $counterGeneration === '') {
+                // A missing counter is a new incarnation even if an older
+                // generation key has not expired yet. Numeric tokens are kept
+                // verbatim by Laravel's Redis cache store so Lua can compare
+                // the same bytes written by Cache::put().
+                $counterGeneration = '';
+                $randomBytes = random_bytes(16);
+                for ($index = 0; $index < strlen($randomBytes); $index++) {
+                    $counterGeneration .= sprintf('%03d', ord($randomBytes[$index]));
+                }
+                $cache->put($counterGenerationKey, $counterGeneration, $config['backlog_ttl']);
+                if ($counter === null) {
+                    $cache->put($backlogKey, 0, $config['backlog_ttl']);
+                }
+            }
+
             if (! $cache->add($generationKey, 1, $config['backlog_ttl'])) {
                 return false;
             }
 
-            $cache->add($backlogKey, 0, $config['backlog_ttl']);
-            $backlog = $cache->increment($backlogKey);
-            $counterIncremented = true;
-            if ((int) $backlog > $config['max_backlog']) {
-                $cache->decrement($backlogKey);
-                $counterIncremented = false;
-                $cache->forget($generationKey);
-
-                return false;
-            }
-
-            $payload['backlog_generation'] = $generation;
-            $payload['backlog_generation_key'] = $generationKey;
-            $payload['backlog_counter_key'] = $backlogKey;
-            $payload['backlog_generation_expires_at'] = $generationExpiresAt;
-
-            return true;
-        } catch (Throwable $exception) {
+            $counterIncremented = false;
             try {
-                $cache->forget($generationKey);
-                if ($counterIncremented) {
+                $backlog = $cache->increment($backlogKey);
+                $counterIncremented = true;
+                if ((int) $backlog > $config['max_backlog']) {
                     $cache->decrement($backlogKey);
-                }
-            } catch (Throwable $cleanupException) {
-                $this->log('error_alert_backlog_release_failed', ['type' => get_class($cleanupException)]);
-            }
+                    $counterIncremented = false;
+                    $cache->forget($generationKey);
 
-            throw $exception;
+                    return false;
+                }
+
+                $payload['backlog_counter_generation'] = $counterGeneration;
+
+                return true;
+            } catch (Throwable $exception) {
+                try {
+                    $cache->forget($generationKey);
+                    if ($counterIncremented) {
+                        $cache->decrement($backlogKey);
+                    }
+                } catch (Throwable $cleanupException) {
+                    $this->log('error_alert_backlog_release_failed', ['type' => get_class($cleanupException)]);
+                }
+
+                throw $exception;
+            }
+        });
+
+        if ($reservation !== true) {
+            return false;
         }
+
+        $payload['backlog_generation'] = $generation;
+        $payload['backlog_generation_key'] = $generationKey;
+        $payload['backlog_counter_key'] = $backlogKey;
+        $payload['backlog_generation_expires_at'] = $generationExpiresAt;
+
+        return true;
     }
 
     /**
@@ -295,6 +330,10 @@ class ErrorAlertManager
             $counterKey = isset($payload['backlog_counter_key'])
                 ? (string) $payload['backlog_counter_key']
                 : '';
+            $counterGeneration = isset($payload['backlog_counter_generation'])
+                && is_string($payload['backlog_counter_generation'])
+                    ? $payload['backlog_counter_generation']
+                    : '';
             if ($generationKey === '' || $counterKey === '') {
                 return;
             }
@@ -302,11 +341,24 @@ class ErrorAlertManager
             $expiresAt = isset($payload['backlog_generation_expires_at'])
                 ? (int) $payload['backlog_generation_expires_at']
                 : 0;
-            if (RedisBacklogRelease::releaseIfSupported($cache, $generationKey, $counterKey, $expiresAt)) {
+            if ($counterGeneration !== '' && RedisBacklogRelease::releaseIfSupported(
+                $cache,
+                $generationKey,
+                $counterKey,
+                $counterGeneration,
+                $expiresAt
+            )) {
                 return;
             }
 
-            $this->withCacheLock($cache, $counterKey.':release-lock', function () use ($cache, $generationKey, $counterKey, $payload, $config) {
+            $this->withCacheLock($cache, $counterKey.':reservation-lock', function () use (
+                $cache,
+                $generationKey,
+                $counterKey,
+                $counterGeneration,
+                $payload,
+                $config
+            ) {
                 $released = $cache->get($generationKey, null);
                 if ($released === null) {
                     return;
@@ -316,6 +368,15 @@ class ErrorAlertManager
                     ? (int) $payload['backlog_generation_expires_at']
                     : 0;
                 if ($expiresAt > 0 && $expiresAt <= time()) {
+                    $cache->forget($generationKey);
+
+                    return;
+                }
+
+                $currentCounterGeneration = $cache->get($counterKey.':counter-generation', null);
+                if ($counterGeneration === '' || $currentCounterGeneration !== $counterGeneration) {
+                    // Pre-generation queue payloads cannot safely decrement a
+                    // counter that may have been recreated since reservation.
                     $cache->forget($generationKey);
 
                     return;
@@ -443,12 +504,15 @@ class ErrorAlertManager
         }
 
         $operation = isset($context['operation']) ? $context['operation'] : null;
-        if (! $operation && is_object($request) && method_exists($request, 'path') && method_exists($request, 'method')) {
-            $operation = substr(
-                (string) call_user_func([$request, 'method']).' '.(string) call_user_func([$request, 'path']),
-                0,
-                160
-            );
+        if (is_object($this->app)
+            && method_exists($this->app, 'runningInConsole')
+            && $this->app->runningInConsole()
+            && $operation !== null) {
+            $operation = $this->safeOperation($operation);
+        } elseif (is_object($request) && method_exists($request, 'method')) {
+            $operation = $this->requestOperation($request);
+        } elseif ($operation !== null) {
+            $operation = $this->safeOperation($operation);
         }
         $type = $exception instanceof Throwable ? get_class($exception) : 'HttpErrorResponse';
         $anonymousClassDelimiter = strpos($type, "\0");
@@ -514,28 +578,7 @@ class ErrorAlertManager
             return null;
         }
 
-        $detail = preg_replace_callback(
-            '/(^|[\r\n])\s*(Cookie|Set-Cookie)\s*:\s*[^\r\n]*/im',
-            static function (array $matches) {
-                return $matches[1].$matches[2].': [REDACTED]';
-            },
-            (string) $detail
-        );
-        $detail = preg_replace(
-            '/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----/is',
-            '[REDACTED]',
-            (string) $detail
-        );
-        $detail = preg_replace_callback(
-            '/"?(password|passwd|secret[_-]?key|encryption[_-]?key|signing[_-]?key|secret|token|access[_-]?token|refresh[_-]?token|api[_-]?key|authorization|cookie|session(?:[_-]?id)?|client[_-]?secret|private[_-]?key|aws[_-]?(?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key)|db[_-]?(?:password|user)|database[_-]?(?:password|user))"?\s*([:=])\s*(?:"[^"]*"|\'[^\']*\'|Bearer\s+[^\s,;]+|[^\s,;]+)/i',
-            static function (array $matches) {
-                return $matches[1].$matches[2].($matches[2] === ':' ? ' ' : '').'[REDACTED]';
-            },
-            (string) $detail
-        );
-        $detail = preg_replace('/\bBearer\s+[^\s,;]+/i', 'Bearer [REDACTED]', (string) $detail);
-        $detail = preg_replace('/([?&](?:password|passwd|secret[_-]?key|encryption[_-]?key|signing[_-]?key|token|access[_-]?token|refresh[_-]?token|api[_-]?key|secret|cookie|session(?:[_-]?id)?|client[_-]?secret|private[_-]?key)=)[^&\s]+/i', '$1[REDACTED]', (string) $detail);
-        $detail = preg_replace('/(\b[a-z][a-z0-9+.-]*:\/\/[^\/\s:@]+:)[^@\s]+@/i', '$1[REDACTED]@', (string) $detail);
+        $detail = $this->redactSensitiveText($detail);
         $detail = trim((string) preg_replace('/\s+/', ' ', (string) $this->normalizeText($detail)));
 
         if (function_exists('mb_substr')) {
@@ -543,6 +586,113 @@ class ErrorAlertManager
         }
 
         return substr($detail, 0, $maxLength);
+    }
+
+    /**
+     * Build operation metadata from the matched route, never from request
+     * parameters. Unmatched paths may contain secrets, so only retain method.
+     *
+     * @param  mixed  $request
+     * @return string|null
+     */
+    protected function requestOperation($request)
+    {
+        if (! is_object($request) || ! method_exists($request, 'method')) {
+            return null;
+        }
+
+        $method = $this->normalizeSingleLine($request->method(), 16);
+        if ($method === null || $method === '') {
+            return null;
+        }
+
+        $route = method_exists($request, 'route') ? $request->route() : null;
+        if (is_object($route)) {
+            $routeName = method_exists($route, 'getName') ? $route->getName() : null;
+            if (is_string($routeName) && trim($routeName) !== '') {
+                return $this->normalizeSingleLine($method.' '.trim($routeName), 160);
+            }
+
+            $routeUri = method_exists($route, 'uri') ? $route->uri() : null;
+            if (is_string($routeUri) && trim($routeUri) !== '') {
+                return $this->normalizeSingleLine($method.' '.ltrim(trim($routeUri), '/'), 160);
+            }
+        }
+
+        return $method;
+    }
+
+    /**
+     * Explicit operation values must be stable labels, not request paths. Apply
+     * credential redaction and omit literal or URL-encoded paths without a route template.
+     *
+     * @param  mixed  $operation
+     * @return string|null
+     */
+    protected function safeOperation($operation)
+    {
+        if (! is_string($operation) || trim($operation) === '') {
+            return null;
+        }
+
+        $operation = $this->normalizeSingleLine($operation, 160);
+        if ($operation === null || $operation === '') {
+            return null;
+        }
+
+        $queryStart = strpos($operation, '?');
+        if ($queryStart !== false) {
+            $operation = substr($operation, 0, $queryStart);
+        }
+
+        $hasEncodedPathSeparator = preg_match('/%(?:25)*(?:2f|5c)/i', $operation) === 1;
+        if ((strpos($operation, '/') !== false
+                || strpos($operation, '\\') !== false
+                || $hasEncodedPathSeparator)
+            && preg_match('/\Aerror-alert:test\/[a-f0-9]{16}\z/i', $operation) !== 1) {
+            if (preg_match('/\A([A-Z]{3,10})(?:\s|$)/i', $operation, $matches) === 1) {
+                $operation = strtoupper($matches[1]);
+            } else {
+                return null;
+            }
+        }
+
+        $operation = $this->redactSensitiveText($operation);
+
+        return $this->normalizeSingleLine($operation, 160);
+    }
+
+    /**
+     * @param  string  $text
+     * @return string
+     */
+    protected function redactSensitiveText($text)
+    {
+        $text = preg_replace_callback(
+            '/(^|[\r\n])\s*(Cookie|Set-Cookie)\s*:\s*[^\r\n]*/im',
+            static function (array $matches) {
+                return $matches[1].$matches[2].': [REDACTED]';
+            },
+            $text
+        );
+        $text = preg_replace('/\b(?:Proxy-)?Authorization\s*:\s*[^\r\n]*/i', 'Authorization: [REDACTED]', (string) $text);
+        $text = preg_replace(
+            '/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----/is',
+            '[REDACTED]',
+            (string) $text
+        );
+        $text = preg_replace_callback(
+            '/["\']?(password|passwd|secret[_-]?key|encryption[_-]?key|signing[_-]?key|secret|token|access[_-]?token|refresh[_-]?token|api[_-]?key|authorization|cookie|session(?:[_-]?id)?|client[_-]?secret|private[_-]?key|aws[_-]?(?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key)|db[_-]?(?:password|user)|database[_-]?(?:password|user))["\']?\s*([:=])\s*(?:"[^"]*"|\'[^\']*\'|Bearer\s+[^\s,;]+|[^\s,;]+)/i',
+            static function (array $matches) {
+                return $matches[1].$matches[2].($matches[2] === ':' ? ' ' : '').'[REDACTED]';
+            },
+            (string) $text
+        );
+        $text = preg_replace('/\bBearer\s+[^\s,;]+/i', 'Bearer [REDACTED]', (string) $text);
+        $text = preg_replace('/([?&](?:password|passwd|secret[_-]?key|encryption[_-]?key|signing[_-]?key|token|access[_-]?token|refresh[_-]?token|api[_-]?key|secret|cookie|session(?:[_-]?id)?|client[_-]?secret|private[_-]?key)=)[^&\s]+/i', '$1[REDACTED]', (string) $text);
+        $text = preg_replace('/(\b[a-z][a-z0-9+.-]*:\/\/[^\/\s:@]+:)[^@\s]+@/i', '$1[REDACTED]@', (string) $text);
+
+        return (string) $text;
     }
 
     /**

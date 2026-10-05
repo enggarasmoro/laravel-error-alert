@@ -90,6 +90,100 @@ class ErrorAlertManagerTest extends TestCase
         $this->assertStringContainsString('secret_key=[REDACTED]', $payload['detail']);
     }
 
+    public function test_exception_detail_redacts_basic_authorization_and_single_quoted_credentials(): void
+    {
+        $app = new FakeApplication(false, [
+            'enabled' => true,
+            'detail_max_length' => 500,
+        ]);
+        $manager = new ErrorAlertManager($app);
+        $exception = new \RuntimeException(
+            "Authorization: Basic QVVESVQ6Q0FOQVJZ\n'password': 'CANARY_PASSWORD'"
+        );
+
+        $payload = $this->invokePayload($manager, $exception);
+
+        $this->assertStringNotContainsString('QVVESVQ6Q0FOQVJZ', $payload['detail']);
+        $this->assertStringNotContainsString('CANARY_PASSWORD', $payload['detail']);
+        $this->assertStringContainsString('Authorization: [REDACTED]', $payload['detail']);
+        $this->assertStringContainsString('password: [REDACTED]', $payload['detail']);
+    }
+
+    public function test_operation_uses_route_metadata_instead_of_request_path_parameters(): void
+    {
+        $manager = new ErrorAlertManager(new FakeApplication(false, [
+            'enabled' => true,
+            'detail_max_length' => 0,
+        ]));
+        $request = new FakeAlertRequest('GET', 'reset/CANARY_RESET_TOKEN', new FakeAlertRoute('password.reset', 'reset/{token}'));
+
+        $payload = $this->invokePayload($manager, new \RuntimeException('error'), [
+            'request' => $request,
+            'operation' => 'reset/CANARY_RESET_TOKEN',
+        ]);
+        $uriPayload = $this->invokePayload($manager, new \RuntimeException('error'), [
+            'request' => new FakeAlertRequest('PATCH', 'reset/CANARY_RESET_TOKEN', new FakeAlertRoute(null, 'reset/{token}')),
+        ]);
+
+        $this->assertSame('GET password.reset', $payload['operation']);
+        $this->assertSame('PATCH reset/{token}', $uriPayload['operation']);
+        $this->assertStringNotContainsString('CANARY_RESET_TOKEN', $payload['operation']);
+        $this->assertStringNotContainsString('CANARY_RESET_TOKEN', $uriPayload['operation']);
+        $this->assertNull($payload['detail']);
+    }
+
+    public function test_operation_falls_back_to_method_and_redacts_explicit_credentials(): void
+    {
+        $manager = new ErrorAlertManager(new FakeApplication(false, [
+            'enabled' => true,
+            'detail_max_length' => 0,
+        ]));
+        $request = new FakeAlertRequest('POST', 'invite/CANARY_PATH_TOKEN', null);
+        $requestPayload = $this->invokePayload($manager, new \RuntimeException('error'), [
+            'request' => $request,
+        ]);
+        $explicitPayload = $this->invokePayload($manager, new \RuntimeException('error'), [
+            'operation' => 'worker pass'."word='CANARY_PASSWORD' token=CANARY_TOKEN",
+        ]);
+        $pathPayload = $this->invokePayload($manager, new \RuntimeException('error'), [
+            'operation' => 'GET /reset/CANARY_PATH_TOKEN?token=CANARY_QUERY',
+        ]);
+        $encodedPathPayload = $this->invokePayload($manager, new \RuntimeException('error'), [
+            'operation' => 'GET reset%2FCANARY_ENCODED_PATH_TOKEN',
+        ]);
+        $doubleEncodedPathPayload = $this->invokePayload($manager, new \RuntimeException('error'), [
+            'operation' => 'GET reset%252FCANARY_DOUBLE_ENCODED_PATH_TOKEN',
+        ]);
+
+        $this->assertSame('POST', $requestPayload['operation']);
+        $this->assertStringNotContainsString('CANARY_PATH_TOKEN', $requestPayload['operation']);
+        $this->assertStringNotContainsString('CANARY_PASSWORD', $explicitPayload['operation']);
+        $this->assertStringNotContainsString('CANARY_TOKEN', $explicitPayload['operation']);
+        $this->assertStringContainsString('password=[REDACTED]', $explicitPayload['operation']);
+        $this->assertSame('GET', $pathPayload['operation']);
+        $this->assertStringNotContainsString('CANARY_PATH_TOKEN', $pathPayload['operation']);
+        $this->assertStringNotContainsString('CANARY_QUERY', $pathPayload['operation']);
+        $this->assertSame('GET', $encodedPathPayload['operation']);
+        $this->assertStringNotContainsString('CANARY_ENCODED_PATH_TOKEN', $encodedPathPayload['operation']);
+        $this->assertSame('GET', $doubleEncodedPathPayload['operation']);
+        $this->assertStringNotContainsString('CANARY_DOUBLE_ENCODED_PATH_TOKEN', $doubleEncodedPathPayload['operation']);
+    }
+
+    public function test_console_operation_preserves_a_safe_explicit_probe_identifier(): void
+    {
+        $manager = new ErrorAlertManager(new FakeApplication(true, [
+            'enabled' => true,
+            'detail_max_length' => 0,
+        ]));
+        $payload = $this->invokePayload($manager, new \RuntimeException('error'), [
+            'request' => new FakeAlertRequest('GET', 'reset/CANARY_RESET_TOKEN', null),
+            'operation' => 'error-alert:test/abcdef1234567890',
+        ]);
+
+        $this->assertSame('error-alert:test/abcdef1234567890', $payload['operation']);
+        $this->assertStringNotContainsString('CANARY_RESET_TOKEN', $payload['operation']);
+    }
+
     public function test_query_exception_detail_omits_sql_bindings_connection_and_database_details(): void
     {
         $app = new FakeApplication(false, [
@@ -147,7 +241,7 @@ class ErrorAlertManagerTest extends TestCase
 
         $this->assertStringContainsString('detail', $payload['detail']);
         $this->assertStringContainsString('next', $payload['detail']);
-        $this->assertStringContainsString('POST /probe', $payload['operation']);
+        $this->assertSame('POST', $payload['operation']);
         $this->assertSame('http Bcc: attacker@example.test', $payload['source']);
         $this->assertStringNotContainsString("\n", $payload['service']);
     }
@@ -290,6 +384,9 @@ class ErrorAlertManagerTest extends TestCase
         $oldGeneration = $oldPayload['backlog_generation'];
         $oldGenerationKey = $oldPayload['backlog_generation_key'];
         $oldCounterKey = $oldPayload['backlog_counter_key'];
+        $counterGenerationKey = $oldCounterKey.':counter-generation';
+        $this->assertSame(1, preg_match('/\A[0-9]{48}\z/', $oldPayload['backlog_counter_generation']));
+        $this->assertSame($cache->values[$counterGenerationKey], $oldPayload['backlog_counter_generation']);
 
         $cache->forget($oldGenerationKey);
 
@@ -309,6 +406,68 @@ class ErrorAlertManagerTest extends TestCase
         $manager->releaseBacklog($newPayload);
 
         $this->assertSame(1, $cache->values[$newPayload['backlog_counter_key']]);
+    }
+
+    public function test_old_backlog_marker_cannot_decrement_counter_recreated_after_counter_only_expiry(): void
+    {
+        $cache = new FakeCacheStore;
+        $app = new FakeApplication(false, [
+            'enabled' => true,
+            'backlog_ttl' => 43200,
+        ]);
+        $app['cache'] = new FakeCacheManager($cache);
+        $app['log'] = new FakeLogger;
+        $this->installFacades($app);
+        $manager = new ErrorAlertManager($app);
+
+        $firstPayload = ['fingerprint' => 'first', 'backlog_key' => 'alert-backlog'];
+        $stalePayload = ['fingerprint' => 'staggered', 'backlog_key' => 'alert-backlog'];
+        $this->assertTrue($this->invokeReservePayload($manager, $firstPayload));
+        $this->assertTrue($this->invokeReservePayload($manager, $stalePayload));
+        $firstMarker = $firstPayload['backlog_generation_key'];
+        $oldCounterGeneration = $stalePayload['backlog_counter_generation'];
+        $staleMarker = $stalePayload['backlog_generation_key'];
+
+        // Simulate the shared counter expiring while a later reservation marker remains alive.
+        $cache->forget($stalePayload['backlog_counter_key']);
+
+        $newPayload = ['fingerprint' => 'after-expiry', 'backlog_key' => 'alert-backlog'];
+        $this->assertTrue($this->invokeReservePayload($manager, $newPayload));
+        $this->assertNotSame($oldCounterGeneration, $newPayload['backlog_counter_generation']);
+        $this->assertSame($cache->values['alert-backlog:counter-generation'], $newPayload['backlog_counter_generation']);
+        $this->assertSame(1, $cache->values[$newPayload['backlog_counter_key']]);
+
+        $manager->releaseBacklog($firstPayload);
+        $staleJob = new SendErrorAlert($stalePayload, null, null, false, true);
+        $this->invokeJobRelease($staleJob);
+
+        $this->assertSame(1, $cache->values[$newPayload['backlog_counter_key']]);
+        $this->assertNull($cache->get($firstMarker));
+        $this->assertNull($cache->get($staleMarker));
+
+        $manager->releaseBacklog($newPayload);
+        $this->assertSame(0, $cache->values[$newPayload['backlog_counter_key']]);
+    }
+
+    public function test_legacy_backlog_payload_does_not_decrement_a_generation_it_cannot_identify(): void
+    {
+        $cache = new FakeCacheStore;
+        $app = new FakeApplication(false, ['enabled' => true, 'backlog_ttl' => 43200]);
+        $app['cache'] = new FakeCacheManager($cache);
+        $app['log'] = new FakeLogger;
+        $this->installFacades($app);
+        $manager = new ErrorAlertManager($app);
+        $payload = ['fingerprint' => 'legacy-payload', 'backlog_key' => 'alert-backlog'];
+
+        $this->assertTrue($this->invokeReservePayload($manager, $payload));
+        unset($payload['backlog_counter_generation']);
+        $counterKey = $payload['backlog_counter_key'];
+        $markerKey = $payload['backlog_generation_key'];
+
+        $manager->releaseBacklog($payload);
+
+        $this->assertSame(1, $cache->values[$counterKey]);
+        $this->assertNull($cache->get($markerKey));
     }
 
     public function test_backlog_cleanup_failure_is_logged_and_does_not_escape(): void
@@ -373,6 +532,7 @@ class ErrorAlertManagerTest extends TestCase
         ];
 
         $this->assertTrue($this->invokeReservePayload($manager, $payload));
+        $cache->lockCalls = 0;
         $manager->releaseBacklog($payload);
 
         $this->assertSame(1, $cache->lockCalls);
@@ -541,6 +701,7 @@ class ErrorAlertManagerTest extends TestCase
         $backlogKey = $dispatcher->jobs[0]->backlogKey;
         $this->assertSame(1, $cache->values[$backlogKey]);
         $this->assertTrue($dispatcher->jobs[0]->ownsBacklogReservation);
+        $this->assertSame($cache->values[$backlogKey.':counter-generation'], $dispatcher->jobs[0]->backlogCounterGeneration);
         $dispatcher->jobs[0]->failed(new \RuntimeException('terminal failure'));
         $this->assertSame(0, $cache->values[$backlogKey]);
     }
@@ -643,10 +804,14 @@ class ErrorAlertManagerTest extends TestCase
     public function test_test_command_resolves_manager_and_configuration_from_bound_application(): void
     {
         $container = new FakeLaravelContainer('testing');
-        $container->instance('enggarasmoro.error-alert', new FakeTestAlertManager);
-        $container->instance('config', new FakeGlobalConfig([
+        $manager = new FakeTestAlertManager;
+        $config = new FakeGlobalConfig([
             'error-alert.delivery' => 'sync',
-        ]));
+            'error-alert.recipients' => ['ops@example.test'],
+        ]);
+        $manager->config = $config;
+        $container->instance('enggarasmoro.error-alert', $manager);
+        $container->instance('config', $config);
         Container::setInstance(new Container);
 
         $command = new TestErrorAlertCommand;
@@ -654,7 +819,156 @@ class ErrorAlertManagerTest extends TestCase
         $tester = new CommandTester($command);
 
         $this->assertSame(0, $tester->execute([]));
-        $this->assertStringContainsString('Test alert sent synchronously.', $tester->getDisplay());
+        $this->assertStringContainsString('Probe handed to the configured mailer synchronously.', $tester->getDisplay());
+        $this->assertCount(1, $manager->reports);
+        $this->assertInstanceOf(\RuntimeException::class, $manager->reports[0]['exception']);
+        $this->assertStringContainsString('Intentional error-alert delivery probe', $manager->reports[0]['exception']->getMessage());
+        $this->assertSame('manual', $manager->reports[0]['context']['source']);
+        $this->assertSame(1, preg_match('/\\Aerror-alert:test\\/[a-f0-9]{16}\\z/', $manager->reports[0]['context']['operation']));
+        $this->assertSame(['ops@example.test'], $manager->reports[0]['recipients']);
+        $this->assertSame(['ops@example.test'], $config->get('error-alert.recipients'));
+    }
+
+    public function test_test_command_can_send_to_one_recipient_synchronously(): void
+    {
+        $container = new FakeLaravelContainer('production');
+        $manager = new FakeTestAlertManager;
+        $config = new FakeGlobalConfig([
+            'error-alert.delivery' => 'queue',
+            'error-alert.recipients' => ['ops@example.test', 'oncall@example.test'],
+        ]);
+        $manager->config = $config;
+        $container->instance('enggarasmoro.error-alert', $manager);
+        $container->instance('config', $config);
+        Container::setInstance(new Container);
+
+        $command = new TestErrorAlertCommand;
+        $command->setLaravel($container);
+        $tester = new CommandTester($command);
+
+        $this->assertSame(0, $tester->execute([
+            '--sync' => true,
+            '--to' => 'enggarasmoro3@gmail.com',
+        ]));
+        $this->assertSame('sync', $manager->reports[0]['delivery']);
+        $this->assertSame(['enggarasmoro3@gmail.com'], $manager->reports[0]['recipients']);
+        $this->assertSame('queue', $config->get('error-alert.delivery'));
+        $this->assertSame(['ops@example.test', 'oncall@example.test'], $config->get('error-alert.recipients'));
+        $this->assertStringContainsString('Probe handed to the configured mailer synchronously.', $tester->getDisplay());
+        $this->assertCount(1, $manager->reports);
+    }
+
+    public function test_test_command_rejects_empty_and_valueless_recipient_options(): void
+    {
+        foreach ([['--to' => ''], ['--to' => null]] as $arguments) {
+            $container = new FakeLaravelContainer('testing');
+            $manager = new FakeTestAlertManager;
+            $config = new FakeGlobalConfig([
+                'error-alert.delivery' => 'queue',
+                'error-alert.recipients' => ['ops@example.test', 'oncall@example.test'],
+            ]);
+            $container->instance('enggarasmoro.error-alert', $manager);
+            $container->instance('config', $config);
+            Container::setInstance(new Container);
+
+            $command = new TestErrorAlertCommand;
+            $command->setLaravel($container);
+            $tester = new CommandTester($command);
+
+            $this->assertSame(1, $tester->execute($arguments));
+            $this->assertStringContainsString('The probe recipient must be one valid email address.', $tester->getDisplay());
+            $this->assertSame([], $manager->reports);
+            $this->assertSame(['ops@example.test', 'oncall@example.test'], $config->get('error-alert.recipients'));
+        }
+    }
+
+    public function test_test_command_rejects_a_non_string_recipient_option(): void
+    {
+        $container = new FakeLaravelContainer('testing');
+        $manager = new FakeTestAlertManager;
+        $config = new FakeGlobalConfig(['error-alert.recipients' => ['ops@example.test']]);
+        $container->instance('enggarasmoro.error-alert', $manager);
+        $container->instance('config', $config);
+        Container::setInstance(new Container);
+
+        $command = new NonStringRecipientTestErrorAlertCommand;
+        $command->setLaravel($container);
+        $tester = new CommandTester($command);
+
+        $this->assertSame(1, $tester->execute(['--to' => 'provided@example.test']));
+        $this->assertStringContainsString('The probe recipient must be one valid email address.', $tester->getDisplay());
+        $this->assertSame([], $manager->reports);
+        $this->assertSame(['ops@example.test'], $config->get('error-alert.recipients'));
+    }
+
+    public function test_test_command_restores_overrides_when_report_returns_false(): void
+    {
+        $container = new FakeLaravelContainer('testing');
+        $manager = new FakeTestAlertManager;
+        $manager->result = false;
+        $config = new FakeGlobalConfig([
+            'error-alert.delivery' => 'queue',
+            'error-alert.recipients' => ['ops@example.test'],
+        ]);
+        $manager->config = $config;
+        $container->instance('enggarasmoro.error-alert', $manager);
+        $container->instance('config', $config);
+        Container::setInstance(new Container);
+        $command = new TestErrorAlertCommand;
+        $command->setLaravel($container);
+        $tester = new CommandTester($command);
+
+        $this->assertSame(1, $tester->execute(['--sync' => true, '--to' => 'probe@example.test']));
+        $this->assertSame('sync', $manager->reports[0]['delivery']);
+        $this->assertSame(['probe@example.test'], $manager->reports[0]['recipients']);
+        $this->assertSame('queue', $config->get('error-alert.delivery'));
+        $this->assertSame(['ops@example.test'], $config->get('error-alert.recipients'));
+    }
+
+    public function test_test_command_restores_overrides_when_report_throws(): void
+    {
+        $container = new FakeLaravelContainer('testing');
+        $manager = new FakeTestAlertManager;
+        $manager->throwOnReport = true;
+        $config = new FakeGlobalConfig([
+            'error-alert.delivery' => 'queue',
+            'error-alert.recipients' => ['ops@example.test'],
+        ]);
+        $manager->config = $config;
+        $container->instance('enggarasmoro.error-alert', $manager);
+        $container->instance('config', $config);
+        Container::setInstance(new Container);
+        $command = new TestErrorAlertCommand;
+        $command->setLaravel($container);
+        $tester = new CommandTester($command);
+
+        try {
+            $tester->execute(['--sync' => true, '--to' => 'probe@example.test']);
+            $this->fail('Expected the probe manager to throw.');
+        } catch (\RuntimeException $exception) {
+            $this->assertSame('probe report failed', $exception->getMessage());
+        }
+
+        $this->assertSame('queue', $config->get('error-alert.delivery'));
+        $this->assertSame(['ops@example.test'], $config->get('error-alert.recipients'));
+    }
+
+    public function test_test_command_rejects_invalid_probe_recipient_without_reporting(): void
+    {
+        $container = new FakeLaravelContainer('testing');
+        $manager = new FakeTestAlertManager;
+        $config = new FakeGlobalConfig(['error-alert.delivery' => 'queue']);
+        $container->instance('enggarasmoro.error-alert', $manager);
+        $container->instance('config', $config);
+        Container::setInstance(new Container);
+
+        $command = new TestErrorAlertCommand;
+        $command->setLaravel($container);
+        $tester = new CommandTester($command);
+
+        $this->assertSame(1, $tester->execute(['--to' => "ops@example.test\r\nBcc: attacker@example.test"]));
+        $this->assertStringContainsString('The probe recipient must be one valid email address.', $tester->getDisplay());
+        $this->assertSame([], $manager->reports);
     }
 
     public function test_check_command_rejects_an_unconfigured_cache_store(): void
@@ -844,6 +1158,13 @@ class ErrorAlertManagerTest extends TestCase
         $method->setAccessible(true);
 
         return $method->invoke($job);
+    }
+
+    protected function invokeJobRelease(SendErrorAlert $job): void
+    {
+        $method = new \ReflectionMethod($job, 'releaseBacklog');
+        $method->setAccessible(true);
+        $method->invoke($job);
     }
 
     protected function invokeSyncSend(ErrorAlertManager $manager, array $payload): bool
@@ -1205,9 +1526,94 @@ class FakeLegacyMailer
 
 class FakeTestAlertManager
 {
+    public $reports = [];
+
+    public $result = true;
+
+    public $config;
+
+    public $throwOnReport = false;
+
     public function report($exception, array $context = [])
     {
-        return true;
+        if ($this->throwOnReport) {
+            throw new \RuntimeException('probe report failed');
+        }
+
+        $this->reports[] = [
+            'exception' => $exception,
+            'context' => $context,
+            'delivery' => $this->config ? $this->config->get('error-alert.delivery') : null,
+            'recipients' => $this->config ? $this->config->get('error-alert.recipients') : null,
+        ];
+
+        return $this->result;
+    }
+}
+
+class NonStringRecipientTestErrorAlertCommand extends TestErrorAlertCommand
+{
+    public function option($key = null)
+    {
+        if ($key === 'to') {
+            return ['not-a-string'];
+        }
+
+        return parent::option($key);
+    }
+}
+
+class FakeAlertRequest
+{
+    private $httpMethod;
+
+    private $requestPath;
+
+    private $matchedRoute;
+
+    public function __construct($httpMethod, $requestPath, $matchedRoute)
+    {
+        $this->httpMethod = $httpMethod;
+        $this->requestPath = $requestPath;
+        $this->matchedRoute = $matchedRoute;
+    }
+
+    public function method()
+    {
+        return $this->httpMethod;
+    }
+
+    public function path()
+    {
+        return $this->requestPath;
+    }
+
+    public function route()
+    {
+        return $this->matchedRoute;
+    }
+}
+
+class FakeAlertRoute
+{
+    private $routeName;
+
+    private $routeUri;
+
+    public function __construct($routeName, $routeUri)
+    {
+        $this->routeName = $routeName;
+        $this->routeUri = $routeUri;
+    }
+
+    public function getName()
+    {
+        return $this->routeName;
+    }
+
+    public function uri()
+    {
+        return $this->routeUri;
     }
 }
 
@@ -1320,6 +1726,11 @@ class FakeGlobalConfig
     public function get($key, $default = null)
     {
         return array_key_exists($key, $this->values) ? $this->values[$key] : $default;
+    }
+
+    public function set($key, $value)
+    {
+        $this->values[$key] = $value;
     }
 }
 

@@ -39,6 +39,9 @@ class SendErrorAlert implements ShouldQueue
     /** @var string|null */
     public $backlogCounterKey;
 
+    /** @var string|null */
+    public $backlogCounterGeneration;
+
     /** @var int|null */
     public $backlogGenerationExpiresAt;
 
@@ -64,6 +67,10 @@ class SendErrorAlert implements ShouldQueue
         $this->backlogKey = isset($payload['backlog_key']) ? (string) $payload['backlog_key'] : null;
         $this->backlogGenerationKey = isset($payload['backlog_generation_key']) ? (string) $payload['backlog_generation_key'] : null;
         $this->backlogCounterKey = isset($payload['backlog_counter_key']) ? (string) $payload['backlog_counter_key'] : null;
+        $this->backlogCounterGeneration = isset($payload['backlog_counter_generation'])
+            && is_string($payload['backlog_counter_generation'])
+                ? $payload['backlog_counter_generation']
+                : null;
         $this->backlogGenerationExpiresAt = isset($payload['backlog_generation_expires_at']) ? (int) $payload['backlog_generation_expires_at'] : null;
         $this->cacheStore = isset($payload['cache_store']) ? (string) $payload['cache_store'] : null;
         $this->ownsBacklogReservation = (bool) $ownsBacklogReservation;
@@ -132,6 +139,10 @@ class SendErrorAlert implements ShouldQueue
             $cacheStore = $this->cacheStore ?: (isset($payload['cache_store']) ? $payload['cache_store'] : null);
             $generationKey = $this->backlogGenerationKey ?: (isset($payload['backlog_generation_key']) ? $payload['backlog_generation_key'] : null);
             $counterKey = $this->backlogCounterKey ?: (isset($payload['backlog_counter_key']) ? $payload['backlog_counter_key'] : null);
+            $counterGeneration = $this->backlogCounterGeneration
+                ?: (isset($payload['backlog_counter_generation']) && is_string($payload['backlog_counter_generation'])
+                    ? $payload['backlog_counter_generation']
+                    : null);
             $store = ! empty($cacheStore) ? Cache::store($cacheStore) : Cache::store();
             if ($generationKey === null || $generationKey === '' || $counterKey === null || $counterKey === '') {
                 $this->backlogReleased = true;
@@ -142,17 +153,38 @@ class SendErrorAlert implements ShouldQueue
             $payloadExpiresAt = isset($payload['backlog_generation_expires_at'])
                 ? (int) $payload['backlog_generation_expires_at']
                 : (int) $this->backlogGenerationExpiresAt;
-            if (RedisBacklogRelease::releaseIfSupported($store, $generationKey, $counterKey, $payloadExpiresAt)) {
+            if ($counterGeneration !== null && RedisBacklogRelease::releaseIfSupported(
+                $store,
+                $generationKey,
+                $counterKey,
+                $counterGeneration,
+                $payloadExpiresAt
+            )) {
                 $this->backlogReleased = true;
 
                 return;
             }
-            $this->withCacheLock($store, $counterKey.':release-lock', function () use ($store, $generationKey, $counterKey, $payloadExpiresAt) {
+            $this->withCacheLock($store, $counterKey.':reservation-lock', function () use (
+                $store,
+                $generationKey,
+                $counterKey,
+                $counterGeneration,
+                $payloadExpiresAt
+            ) {
                 $released = $store->get($generationKey, null);
                 if ($released === null) {
                     return;
                 }
                 if ($payloadExpiresAt > 0 && $payloadExpiresAt <= time()) {
+                    $store->forget($generationKey);
+
+                    return;
+                }
+
+                $currentCounterGeneration = $store->get($counterKey.':counter-generation', null);
+                if ($counterGeneration === null || $currentCounterGeneration !== $counterGeneration) {
+                    // A legacy payload has no counter identity. Consume its
+                    // marker without decrementing a counter it cannot identify.
                     $store->forget($generationKey);
 
                     return;

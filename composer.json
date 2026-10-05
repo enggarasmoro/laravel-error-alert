@@ -23,6 +23,7 @@
         "league/commonmark": ">=2.0 <2.10.2"
     },
     "require-dev": {
+        "illuminate/redis": "^6.0 || ^7.0 || ^8.0 || ^9.0 || ^10.0 || ^11.0 || ^12.0 || ^13.0",
         "phpstan/phpstan": "^1.12",
         "phpunit/phpunit": "^8.5 || ^9.6 || ^10.5 || ^11.5 || ^12.0"
     },
