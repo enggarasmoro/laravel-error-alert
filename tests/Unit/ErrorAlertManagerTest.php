@@ -385,7 +385,7 @@ class ErrorAlertManagerTest extends TestCase
         $oldGenerationKey = $oldPayload['backlog_generation_key'];
         $oldCounterKey = $oldPayload['backlog_counter_key'];
         $counterGenerationKey = $oldCounterKey.':counter-generation';
-        $this->assertMatchesRegularExpression('/\A[0-9]{48}\z/', $oldPayload['backlog_counter_generation']);
+        $this->assertSame(1, preg_match('/\A[0-9]{48}\z/', $oldPayload['backlog_counter_generation']));
         $this->assertSame($cache->values[$counterGenerationKey], $oldPayload['backlog_counter_generation']);
 
         $cache->forget($oldGenerationKey);
